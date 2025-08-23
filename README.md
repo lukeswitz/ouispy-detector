@@ -20,6 +20,10 @@ Professional BLE scanning system that detects specific devices by MAC address or
 3. **Add targets** - Enter OUI prefixes (`AA:BB:CC`) or full MAC addresses
 4. **Save configuration** - Device automatically switches to scanning mode
 
+### OUI Lists
+- [Flock Cameras Nationwide](https://github.com/lukeswitz/ouispy-foxhunter/blob/main/OUIs/flock.md)
+- [Privacy Invaders](https://github.com/lukeswitz/ouispy-foxhunter/blob/main/OUIs/privacy_invaders.md)
+
 ## Features
 
 ### Detection System
