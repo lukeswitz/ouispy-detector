@@ -61,11 +61,10 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
 
 ## LED Indicators
 
-- Purple: acquiring GPS
-- Dim white (≈15 s): scanning heartbeat
+- Blue/Purple Pulse: acquiring GPS
+- White/Red blink (≈15 s): scanning loop
 - Green ×3: new match or ≥ 30 s re‑detect
 - Blue ×2: ≥ 5 s re‑detect
-
 ---
 
 ## Notes and Tips
