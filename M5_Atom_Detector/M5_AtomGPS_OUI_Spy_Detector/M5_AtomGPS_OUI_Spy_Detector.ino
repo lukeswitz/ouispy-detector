@@ -63,6 +63,9 @@ unsigned long configStartTime = 0;
 unsigned long lastConfigActivity = 0;
 unsigned long modeSwitchScheduled = 0;
 unsigned long deviceResetScheduled = 0;
+unsigned long lastWiFiScanTime = 0;
+const int WIFI_SCAN_INTERVAL = 10000;  // 10 seconds between WiFi scans
+bool wifiScanInProgress = false;
 
 // LED control variables - accessed by both cores
 volatile LEDPattern currentLEDPattern = LED_OFF;
@@ -268,6 +271,17 @@ void ScanTask(void* pvParameters) {
         lastScanTime = currentMillis;
       }
 
+      // Start WiFi scan every 10 seconds if not already scanning
+      if (currentMillis - lastWiFiScanTime >= WIFI_SCAN_INTERVAL && !wifiScanInProgress) {
+        performWiFiScan();
+        lastWiFiScanTime = currentMillis;
+      }
+
+      // Check for WiFi scan results
+      if (wifiScanInProgress) {
+        processWiFiScanResults();
+      }
+
       // Clean up expired devices every 10 seconds
       if (currentMillis - lastCleanupTime >= 10000) {
         int devicesBefore = devices.size();
@@ -287,7 +301,7 @@ void ScanTask(void* pvParameters) {
 
       // Status report every 30 seconds
       if (currentMillis - lastStatusTime >= 30000) {
-        Serial.println("Status: Scanning - " + String(devices.size()) + " active devices tracked");
+        Serial.println("Status: Scanning - " + String(devices.size()) + " active devices tracked (BLE+WiFi)");
         lastStatusTime = currentMillis;
       }
     }
@@ -415,6 +429,98 @@ void logMatchRow(const String& type, const String& mac, int rssi, const String& 
   }
 }
 
+// WiFi Scanning
+
+void performWiFiScan() {
+  if (wifiScanInProgress) return;
+  
+  Serial.println("Starting WiFi scan...");
+  wifiScanInProgress = true;
+  
+  // Set WiFi to station mode
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  // Start WiFi scan
+  int networksFound = WiFi.scanNetworks(true); // async scan
+}
+
+void processWiFiScanResults() {
+  int networksFound = WiFi.scanComplete();
+  
+  if (networksFound <= 0) {
+    if (networksFound == WIFI_SCAN_FAILED) {
+      Serial.println("WiFi scan failed");
+      wifiScanInProgress = false;
+    }
+    return;
+  }
+  
+  Serial.println("WiFi scan complete, found " + String(networksFound) + " networks");
+  
+  for (int i = 0; i < networksFound; i++) {
+    String bssid = WiFi.BSSIDstr(i);
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    
+    unsigned long currentMillis = millis();
+    String matchedDescription;
+    bool matchFound = matchesTargetFilter(bssid, matchedDescription);
+    
+    if (!matchFound) continue;
+    
+    bool known = false;
+    for (auto& dev : devices) {
+      if (dev.macAddress == bssid) {
+        known = true;
+        
+        if (dev.inCooldown && currentMillis < dev.cooldownUntil) break;
+        if (dev.inCooldown && currentMillis >= dev.cooldownUntil) dev.inCooldown = false;
+        
+        unsigned long dt = currentMillis - dev.lastSeen;
+        
+        if (dt >= 30000) {
+          // Trigger LED pattern with WIFI indication
+          triggerTripleBlink();  // We'll use the same pattern but could modify for WiFi
+          Serial.println("WIFI RE-DETECTED after 30+ sec: " + matchedDescription);
+          Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+          logMatchRow("WIFI-RE30s", bssid, rssi, matchedDescription);
+          dev.inCooldown = true;
+          dev.cooldownUntil = currentMillis + 10000;
+        } else if (dt >= 5000) {
+          triggerDoubleBlink();
+          Serial.println("WIFI RE-DETECTED after 5+ sec: " + matchedDescription);
+          Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+          logMatchRow("WIFI-RE5s", bssid, rssi, matchedDescription);
+          dev.inCooldown = true;
+          dev.cooldownUntil = currentMillis + 5000;
+        }
+        
+        dev.lastSeen = currentMillis;
+        break;
+      }
+    }
+    
+    if (!known) {
+      DeviceInfo newDev{ bssid, rssi, currentMillis, currentMillis, false, 0, matchedDescription };
+      devices.push_back(newDev);
+      
+      triggerTripleBlink();
+      Serial.println("NEW WIFI DEVICE DETECTED: " + matchedDescription);
+      Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+      logMatchRow("WIFI-NEW", bssid, rssi, matchedDescription);
+      
+      auto& dev = devices.back();
+      dev.inCooldown = true;
+      dev.cooldownUntil = currentMillis + 5000;
+    }
+  }
+  
+  // Free memory used by scan
+  WiFi.scanDelete();
+  wifiScanInProgress = false;
+}
 
 // MAC Address Utility Functions
 
@@ -681,10 +787,10 @@ String generateConfigHTML() {
         <h1>M5GPS OUI-SPY</h1>
         
         <div class="status">
-            Configure MAC addresses and OUI prefixes to detect. LED patterns indicate detection type:
-            <br><strong>Green x 3:</strong> New device or re-detected after 30s
-            <br><strong>Blue x 2:</strong> Re-detected after 5s
-            <br><strong>Red x 1:</strong> Status blink
+            Configure MAC addresses and OUI prefixes to detect. LED patterns:
+            <br><strong>Green x3:</strong> New device or re-detected after 30s
+            <br><strong>Blue x2:</strong> Re-detected after 5s
+            <br><strong>Red x1:</strong> Status blink
         </div>
 
         <form method="POST" action="/save">
@@ -994,7 +1100,8 @@ void startScanningMode() {
   server.end();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_OFF);
-
+  delay(500);
+  
   Serial.println("\n=== STARTING M5 ATOM SCANNING MODE ===");
   for (const TargetFilter& filter : targetFilters) {
     String type = filter.isFullMAC ? "Full MAC" : "OUI";
@@ -1002,6 +1109,7 @@ void startScanningMode() {
   }
   Serial.println("==============================\n");
 
+  // Initialize BLE scanning
   NimBLEDevice::init("");
   delay(1000);
 
@@ -1013,6 +1121,10 @@ void startScanningMode() {
     pBLEScan->setScanCallbacks(new MyAdvertisedDeviceCallbacks());
   }
 
+  // Initialize WiFi for scanning
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  
   delay(500);
   triggerReadySignal();
   delay(2000);
@@ -1020,8 +1132,13 @@ void startScanningMode() {
   if (pBLEScan != nullptr) {
     pBLEScan->start(3, false, false);
     Serial.println("BLE scanning started!");
-    startStatusBlinking();  // Start status blinking pattern
   }
+  
+  Serial.println("WiFi scanning ready!");
+  lastWiFiScanTime = 0;  // Force WiFi scan immediately
+  wifiScanInProgress = false;
+  
+  startStatusBlinking();  // Start status blinking pattern
 }
 
 void setup() {
@@ -1064,7 +1181,7 @@ void setup() {
 
   Serial.println("\n\n=== M5GPS OUI-SPY ===");
   Serial.println("LED: GPIO27 (Single RGB LED)");
-  Serial.println("Mode: Multi-target BLE device detection");
+  Serial.println("Mode: Multi-target BLE/WiFi device detection");
   Serial.println("Patterns: Green×3 (new), Blue×2 (5s), Red×1 (status)");
   Serial.println("Initializing...\n");
 
