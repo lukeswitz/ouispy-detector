@@ -1,7 +1,7 @@
 # OUI‑Spy Detector 
 ### (BLE + Wi‑Fi) — M5Stack ATOM (Lite / ATOM GPS)
 
-Unified detector firmware for multi‑target BLE and Wi‑Fi with GPS+SD logging and Web configuration.
+Unified (beta) detector firmware for multi‑target BLE and Wi‑Fi with GPS+SD logging and Web configuration.
 
 Related fork [Fox Hunter variant](https://github.com/lukeswitz/ouispy-foxhunter/tree/main/M5_Atom_Foxhunt)
 
@@ -61,10 +61,10 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
 
 ## LED Indicators
 
-- Blue/Purple Pulse: acquiring GPS
-- White/Red blink (≈15 s): scanning loop
-- Green ×3: new match or ≥ 30 s re‑detect
-- Blue ×2: ≥ 5 s re‑detect
+- Indigo Pulse: acquiring GPS
+- Blue (≈15 s): scanning loop
+- Green ×3: new match or ≥ 30s re‑detect
+- Blue Blink ×2: ≥ 5s re‑detect
 ---
 
 ## Notes and Tips
