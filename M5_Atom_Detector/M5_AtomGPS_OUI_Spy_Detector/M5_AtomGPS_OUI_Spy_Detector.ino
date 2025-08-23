@@ -10,21 +10,19 @@
 #include <nvs_flash.h>
 #include <vector>
 #include <algorithm>
-#include <FastLED.h>
 #include <M5Atom.h>
 #include <SD.h>
 #include <SPI.h>
 #include <TinyGPS++.h>
 
+// FreeRTOS task handles
+TaskHandle_t LEDTaskHandle = NULL;
+TaskHandle_t ScanTaskHandle = NULL;
 
 // Hardware Configuration - M5 Atom Lite
 #define LED_PIN 27
-#undef NUM_LEDS
-#define LED_COUNT 1
 #define LED_BRIGHTNESS 80
-
-// LED setup
-CRGB leds[LED_COUNT];
+#define ATOM_LEDS 1
 
 // GPS
 TinyGPSPlus gps;
@@ -34,12 +32,10 @@ bool sdReady = false;
 char fileName[64];
 bool REQUIRE_GPS_FIX = true;  // set false to skip blocking wait
 
-
 // WiFi AP Configuration
 #define AP_SSID "snoopuntothem"
 #define AP_PASSWORD "astheysnoopuntous"
 #define CONFIG_TIMEOUT 20000  // 20 seconds timeout for config mode
-
 
 // Operating Modes
 enum OperatingMode {
@@ -47,6 +43,16 @@ enum OperatingMode {
   SCANNING_MODE
 };
 
+// LED Pattern States
+enum LEDPattern {
+  LED_OFF,
+  LED_STATUS_BLINK,
+  LED_SINGLE_BLINK,  // Red x1
+  LED_DOUBLE_BLINK,  // Blue x2
+  LED_TRIPLE_BLINK,  // Green x3
+  LED_READY_SIGNAL,  // Purple ascending
+  LED_GPS_WAIT       // Purple variable brightness
+};
 
 // Global Variables
 OperatingMode currentMode = CONFIG_MODE;
@@ -58,12 +64,9 @@ unsigned long lastConfigActivity = 0;
 unsigned long modeSwitchScheduled = 0;
 unsigned long deviceResetScheduled = 0;
 
-// LED blink synchronization - avoid concurrent operations
-volatile bool newMatchFound = false;
-String detectedMAC = "";
-int detectedRSSI = 0;
-String matchedFilter = "";
-String matchType = "";  // "NEW", "RE-5s", "RE-30s"
+// LED control variables - accessed by both cores
+volatile LEDPattern currentLEDPattern = LED_OFF;
+volatile int ledPatternParam = 0;  // For GPS satellites count, etc.
 
 // Device tracking
 struct DeviceInfo {
@@ -89,120 +92,256 @@ std::vector<TargetFilter> targetFilters;
 void startScanningMode();
 class MyAdvertisedDeviceCallbacks;
 
+// FreeRTOS task definitions
+#if CONFIG_FREERTOS_UNICORE
+#define ARDUINO_RUNNING_CORE 0
+#else
+#define ARDUINO_RUNNING_CORE 1
+#endif
 
-// LED Pattern Functions
-
-void initializeLED() {
-  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, LED_COUNT);
-  FastLED.setBrightness(LED_BRIGHTNESS);
-  FastLED.clear();
-  FastLED.show();
-}
-
-void singleBlink() {
-  leds[0] = CRGB::Red;
-  FastLED.show();
-  delay(200);
-  leds[0] = CRGB::Black;
-  FastLED.show();
-}
-
-void doubleBlink() {
-  // Two fast blue blinks for re-detection after 5+ seconds
-  for (int i = 0; i < 2; i++) {
-    leds[0] = CRGB::Blue;
-    FastLED.show();
-    delay(150);
-    leds[0] = CRGB::Black;
-    FastLED.show();
-    if (i < 1) delay(150);
-  }
-}
-
-void tripleBlink() {
-  // Three fast green blinks for new device or re-detection after 30+ seconds
-  for (int i = 0; i < 3; i++) {
-    leds[0] = CRGB::Green;
-    FastLED.show();
-    delay(150);
-    leds[0] = CRGB::Black;
-    FastLED.show();
-    if (i < 2) delay(150);
-  }
-}
-
-void readySignal() {
-  // Purple ascending brightness pattern to indicate "ready to scan"
-  for (int brightness = 0; brightness <= 150; brightness += 10) {
-    leds[0] = CRGB(brightness / 2, 0, brightness);  // Purple gradient
-    FastLED.show();
-    delay(50);
-  }
-  for (int brightness = 150; brightness >= 0; brightness -= 10) {
-    leds[0] = CRGB(brightness / 2, 0, brightness);
-    FastLED.show();
-    delay(50);
-  }
-  leds[0] = CRGB::Black;
-  FastLED.show();
-  delay(500);
-}
-
-void blinkLEDFaster(int numSat) {
-  // Similar pattern to readySignal but simplified for the waiting phase
-  static unsigned long prev = 0;
-  static bool on = false;
-  static int brightness = 0;
-  static bool ascending = true;
+// LED Task - runs on Core 0
+void LEDTask(void *pvParameters) {
+  static unsigned long previousMillis = 0;
+  static unsigned long patternStartTime = 0;
+  static bool patternActive = false;
   
-  // Adjust timing based on satellite count, but keep it relatively smooth
-  unsigned long interval = (numSat <= 1) ? 100UL : max(50UL, 300UL / (unsigned long)numSat);
-  
-  unsigned long now = millis();
-  if (now - prev >= interval) {
-    prev = now;
+  while (1) {
+    unsigned long currentMillis = millis();
     
-    if (ascending) {
-      // Gradually increase brightness
-      brightness += 5;
-      if (brightness >= 100) {
-        ascending = false;
-      }
-    } else {
-      // Gradually decrease brightness
-      brightness -= 5;
-      if (brightness <= 0) {
-        ascending = true;
-        // Complete one cycle
-        on = !on;  // Toggle for satellite count effect
-      }
+    switch (currentLEDPattern) {
+      case LED_OFF:
+        M5.dis.drawpix(0, 0x000000);  // Black
+        patternActive = false;
+        break;
+        
+      case LED_STATUS_BLINK:
+        {
+          unsigned long interval = (currentMode == CONFIG_MODE) ? 10000 : 15000;
+          if (currentMillis - previousMillis >= interval) {
+            M5.dis.drawpix(0, 0xFFFFFF);  // White
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            M5.dis.drawpix(0, 0x000000);  // Black
+            previousMillis = currentMillis;
+          }
+        }
+        break;
+        
+      case LED_SINGLE_BLINK: // Red x1
+        if (!patternActive) {
+          patternStartTime = currentMillis;
+          patternActive = true;
+        }
+        {
+          unsigned long elapsed = currentMillis - patternStartTime;
+          if (elapsed <= 200) {
+            M5.dis.drawpix(0, 0x0000FF);  // RED (note: GRB format, so 0x0000FF = red)
+          } else if (elapsed <= 400) {
+            M5.dis.drawpix(0, 0x000000);  // Black
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_OFF;
+            patternActive = false;
+          }
+        }
+        break;
+        
+      case LED_DOUBLE_BLINK: // Blue x2
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+          
+          unsigned long elapsed = currentMillis - patternStartTime;
+          
+          if (elapsed < 150) {
+            M5.dis.drawpix(0, 0xFF0000);  // BLUE (note: GRB format)
+          } else if (elapsed < 300) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 450) {
+            M5.dis.drawpix(0, 0xFF0000);  // BLUE
+          } else if (elapsed < 600) {
+            M5.dis.drawpix(0, 0x000000);
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_OFF;
+            patternActive = false;
+          }
+        }
+        break;
+        
+      case LED_TRIPLE_BLINK: // Green x3
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+          
+          unsigned long elapsed = currentMillis - patternStartTime;
+          
+          if (elapsed < 150) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN (GRB format)
+          } else if (elapsed < 300) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 450) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+          } else if (elapsed < 600) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 750) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+          } else if (elapsed < 900) {
+            M5.dis.drawpix(0, 0x000000);
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_OFF;
+            patternActive = false;
+          }
+        }
+        break;
+        
+      case LED_READY_SIGNAL: // Purple fade
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+          
+          unsigned long elapsed = currentMillis - patternStartTime;
+          if (elapsed > 2000) { // 2 second fade
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_OFF;
+            patternActive = false;
+          } else {
+            // Simple purple fade
+            int brightness = (elapsed < 1000) ? (elapsed * 255 / 1000) : (255 - ((elapsed - 1000) * 255 / 1000));
+            uint32_t purple = (brightness << 8) | brightness;  // Purple in GRB format
+            M5.dis.drawpix(0, purple);
+          }
+        }
+        break;
+        
+      case LED_GPS_WAIT: // Purple variable brightness
+        {
+          static int brightness = 0;
+          static bool ascending = true;
+          int numSat = ledPatternParam;
+          unsigned long interval = (numSat <= 1) ? 100UL : max(50UL, 300UL / (unsigned long)numSat);
+          
+          if (currentMillis - previousMillis >= interval) {
+            if (ascending) {
+              brightness += 10;
+              if (brightness >= 255) ascending = false;
+            } else {
+              brightness -= 10;
+              if (brightness <= 0) ascending = true;
+            }
+            
+            uint32_t purple = (brightness << 8) | brightness;  // Purple in GRB format  
+            M5.dis.drawpix(0, purple);
+            previousMillis = currentMillis;
+          }
+        }
+        break;
     }
     
-    // Purple with variable brightness
-    leds[0] = on ? CRGB(brightness/2, 0, brightness) : CRGB::Black;
-    FastLED.show();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
+}
+
+// Scanning Task - runs on Core 1
+void ScanTask(void* pvParameters) {
+  static unsigned long lastScanTime = 0;
+  static unsigned long lastCleanupTime = 0;
+  static unsigned long lastStatusTime = 0;
+
+  while (1) {
+    if (currentMode == SCANNING_MODE) {
+      unsigned long currentMillis = millis();
+
+      // Restart BLE scan every 3 seconds
+      if (currentMillis - lastScanTime >= 3000) {
+        if (pBLEScan) {
+          pBLEScan->stop();
+          vTaskDelay(10 / portTICK_PERIOD_MS);
+          pBLEScan->start(2, false, false);
+        }
+        lastScanTime = currentMillis;
+      }
+
+      // Clean up expired devices every 10 seconds
+      if (currentMillis - lastCleanupTime >= 10000) {
+        int devicesBefore = devices.size();
+        for (auto it = devices.begin(); it != devices.end();) {
+          if (currentMillis - it->lastSeen >= 60000) {
+            Serial.println("Removed expired device: " + it->macAddress);
+            it = devices.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        if (devices.size() != devicesBefore) {
+          Serial.println("Cleanup: Removed " + String(devicesBefore - devices.size()) + " expired devices");
+        }
+        lastCleanupTime = currentMillis;
+      }
+
+      // Status report every 30 seconds
+      if (currentMillis - lastStatusTime >= 30000) {
+        Serial.println("Status: Scanning - " + String(devices.size()) + " active devices tracked");
+        lastStatusTime = currentMillis;
+      }
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);  // 100ms delay
+  }
+}
+
+// LED Pattern Functions (now just set the pattern, don't block)
+void triggerSingleBlink() {
+  currentLEDPattern = LED_SINGLE_BLINK;
+}
+
+void triggerDoubleBlink() {
+  currentLEDPattern = LED_DOUBLE_BLINK;
+}
+
+void triggerTripleBlink() {
+  currentLEDPattern = LED_TRIPLE_BLINK;
+}
+
+void triggerReadySignal() {
+  currentLEDPattern = LED_READY_SIGNAL;
+}
+
+void startGPSWaitPattern(int numSatellites) {
+  ledPatternParam = numSatellites;
+  currentLEDPattern = LED_GPS_WAIT;
+}
+
+void stopGPSWaitPattern() {
+  currentLEDPattern = LED_OFF;
+}
+
+void startStatusBlinking() {
+  currentLEDPattern = LED_STATUS_BLINK;
 }
 
 void waitForGPSFix() {
   Serial.println("Waiting for GPS fix...");
   while (REQUIRE_GPS_FIX && !gps.location.isValid()) {
     while (Serial1.available() > 0) gps.encode(Serial1.read());
-    blinkLEDFaster(gps.satellites.value());
+    startGPSWaitPattern(gps.satellites.value());
     delay(100);
   }
-  leds[0] = CRGB::Black;
-  FastLED.show();
+  stopGPSWaitPattern();
   Serial.println("GPS fix obtained or bypassed.");
 }
 
 void startupTest() {
-  // Quick LED test on startup
-  leds[0] = CRGB::White;
-  FastLED.show();
+  
+  M5.dis.drawpix(0, 0xFFFFFF);  // White
   delay(300);
-  leds[0] = CRGB::Black;
-  FastLED.show();
+  M5.dis.drawpix(0, 0x000000);  // Black
 }
 
 // SD & File Creation
@@ -786,8 +925,7 @@ void startConfigMode() {
 }
 
 
-// BLE Advertised Device Callback Class
-
+/// BLE Advertised Device Callback Class
 class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     if (currentMode != SCANNING_MODE) return;
@@ -811,21 +949,19 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
         unsigned long dt = currentMillis - dev.lastSeen;
 
         if (dt >= 30000) {
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = matchedDescription;
-          matchType = "RE-30s";
-          newMatchFound = true;
-          tripleBlink();
+          // Trigger LED pattern without blocking
+          triggerTripleBlink();
+          Serial.println("RE-DETECTED after 30+ sec: " + matchedDescription);
+          Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
+          logMatchRow("RE-30s", mac, rssi, matchedDescription);
           dev.inCooldown = true;
           dev.cooldownUntil = currentMillis + 10000;
         } else if (dt >= 5000) {
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = matchedDescription;
-          matchType = "RE-5s";
-          newMatchFound = true;
-          doubleBlink();
+          // Trigger LED pattern without blocking
+          triggerDoubleBlink();
+          Serial.println("RE-DETECTED after 5+ sec: " + matchedDescription);
+          Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
+          logMatchRow("RE-5s", mac, rssi, matchedDescription);
           dev.inCooldown = true;
           dev.cooldownUntil = currentMillis + 5000;
         }
@@ -839,12 +975,11 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
       DeviceInfo newDev{ mac, rssi, currentMillis, currentMillis, false, 0, matchedDescription };
       devices.push_back(newDev);
 
-      detectedMAC = mac;
-      detectedRSSI = rssi;
-      matchedFilter = matchedDescription;
-      matchType = "NEW";
-      newMatchFound = true;
-      tripleBlink();
+      // Trigger LED pattern without blocking
+      triggerTripleBlink();
+      Serial.println("NEW DEVICE DETECTED: " + matchedDescription);
+      Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
+      logMatchRow("NEW", mac, rssi, matchedDescription);
 
       auto& dev = devices.back();
       dev.inCooldown = true;
@@ -879,26 +1014,37 @@ void startScanningMode() {
   }
 
   delay(500);
-  readySignal();
+  triggerReadySignal();
   delay(2000);
 
   if (pBLEScan != nullptr) {
-    // bool start(uint32_t duration, bool isContinue=false, bool stayActive=true)
     pBLEScan->start(3, false, false);
     Serial.println("BLE scanning started!");
+    startStatusBlinking();  // Start status blinking pattern
   }
 }
 
 void setup() {
   delay(2000);
-
-  // Initialize Serial
   Serial.begin(115200);
   delay(1000);
 
-  M5.begin(true, false, true);
-  initializeLED();
+  M5.begin(true, false, true); 
+  delay(50);  
+  
   startupTest();
+
+  // Create LED task on Core 0 (protocol core)
+  xTaskCreatePinnedToCore(
+    LEDTask,         // Function to implement the task
+    "LEDTask",       // Name of the task
+    2048,            // Stack size in bytes
+    NULL,            // Task input parameter
+    1,               // Priority of the task
+    &LEDTaskHandle,  // Task handle
+    0                // Core where the task should run (0)
+  );
+
 
   // Power down radio while doing SD init
   WiFi.mode(WIFI_OFF);
@@ -965,11 +1111,9 @@ void setup() {
 
   if (factoryReset) {
     Serial.println("FACTORY RESET FLAG DETECTED - Clearing all data...");
-
     preferences.begin("ouispy", false);
     preferences.clear();
     preferences.end();
-
     targetFilters.clear();
     Serial.println("Factory reset complete - starting with clean state");
   } else {
@@ -990,30 +1134,34 @@ void setup() {
   // Configuration AP and web UI
   Serial.println("Starting configuration mode...");
   startConfigMode();
+
+  // Create scanning task on Core 1 (application core)
+  xTaskCreatePinnedToCore(
+    ScanTask,         // Function to implement the task
+    "ScanTask",       // Name of the task
+    4096,             // Stack size in bytes
+    NULL,             // Task input parameter
+    2,                // Priority of the task (higher than LED)
+    &ScanTaskHandle,  // Task handle
+    1                 // Core where the task should run (1)
+  );
 }
 
-
 void loop() {
-  // Wait on GPS
+  // Handle GPS reading on main loop
   while (Serial1.available() > 0) {
     gps.encode(Serial1.read());
   }
 
-  static unsigned long lastScanTime = 0;
-  static unsigned long lastCleanupTime = 0;
-  static unsigned long lastStatusTime = 0;
-  static unsigned long lastStatusBlink = 0;
   unsigned long currentMillis = millis();
 
   if (currentMode == CONFIG_MODE) {
     // Handle scheduled device reset
     if (deviceResetScheduled > 0 && currentMillis >= deviceResetScheduled) {
       Serial.println("Scheduled device reset - setting factory reset flag and restarting...");
-
       preferences.begin("ouispy", false);
       preferences.putBool("factoryReset", true);
       preferences.end();
-
       delay(500);
       ESP.restart();
     }
@@ -1028,18 +1176,15 @@ void loop() {
 
     // Config timeout logic
     if (targetFilters.size() == 0) {
-      // No saved filters - stay in config mode
       if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
         Serial.println("No saved filters - staying in config mode indefinitely");
         Serial.println("Connect to 'snoopuntothem' AP to configure filters!");
       }
     } else if (targetFilters.size() > 0) {
-      // Have saved filters - timeout if no one connected
       if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
         Serial.println("No connection within 20s - using saved filters, switching to scanning");
         startScanningMode();
       } else if (lastConfigActivity > configStartTime) {
-        // Someone connected - wait for submission
         static unsigned long lastConnectedMsg = 0;
         if (currentMillis - configStartTime > CONFIG_TIMEOUT && currentMillis - lastConnectedMsg > 30000) {
           Serial.println("Web interface connected - waiting for configuration...");
@@ -1049,83 +1194,10 @@ void loop() {
     }
 
     // Status blink in config mode every 10 seconds
-    if (currentMillis - lastStatusBlink >= 10000) {
-      singleBlink();
-      lastStatusBlink = currentMillis;
-    }
-
-    delay(100);
-    return;
-  }
-
-  // Scanning mode loop
-  if (currentMode == SCANNING_MODE) {
-    if (newMatchFound) {
-      Serial.println(">> Match found! <<");
-      Serial.print("Device: " + detectedMAC);
-      Serial.print(" | RSSI: " + String(detectedRSSI));
-      Serial.println(" | Filter: " + matchedFilter);
-
-      if (matchType == "NEW") {
-        Serial.println("NEW DEVICE DETECTED: " + matchedFilter);
-        Serial.println("MAC: " + detectedMAC);
-      } else if (matchType == "RE-30s") {
-        Serial.println("RE-DETECTED after 30+ sec: " + matchedFilter);
-      } else if (matchType == "RE-5s") {
-        Serial.println("RE-DETECTED after 5+ sec: " + matchedFilter);
-      }
-
-      // Log to SD with GPS
-      logMatchRow(matchType, detectedMAC, detectedRSSI, matchedFilter);
-
-      Serial.println("==============================");
-      newMatchFound = false;
-    }
-
-    // Restart BLE scan every 3 seconds
-    if (currentMillis - lastScanTime >= 3000) {
-      if (pBLEScan) {
-        pBLEScan->stop();
-        delay(10);
-        pBLEScan->start(2, false, false);
-      }
-      lastScanTime = currentMillis;
-    }
-
-    // Clean up expired devices every 10 seconds
-    if (currentMillis - lastCleanupTime >= 10000) {
-      int devicesBefore = devices.size();
-
-      for (auto it = devices.begin(); it != devices.end();) {
-        if (currentMillis - it->lastSeen >= 60000) {
-          Serial.println("Removed expired device: " + it->macAddress);
-          it = devices.erase(it);
-        } else {
-          ++it;
-        }
-      }
-
-      if (devices.size() != devicesBefore) {
-        Serial.println("Cleanup: Removed " + String(devicesBefore - devices.size()) + " expired devices");
-      }
-
-      lastCleanupTime = currentMillis;
-    }
-
-    // Status report every 30 seconds
-    if (currentMillis - lastStatusTime >= 30000) {
-      Serial.println("Status: Scanning - " + String(devices.size()) + " active devices tracked");
-      lastStatusTime = currentMillis;
-    }
-
-    // Subtle status blink every 15 seconds in scanning mode
-    if (currentMillis - lastStatusBlink >= 15000) {
-      leds[0] = CRGB(10, 10, 10);  // Very dim white
-      FastLED.show();
-      delay(50);
-      leds[0] = CRGB::Black;
-      FastLED.show();
-      lastStatusBlink = currentMillis;
+    static unsigned long lastConfigBlink = 0;
+    if (currentMillis - lastConfigBlink >= 10000) {
+      triggerSingleBlink();
+      lastConfigBlink = currentMillis;
     }
   }
 
