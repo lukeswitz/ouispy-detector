@@ -61,10 +61,11 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
 
 ## LED Indicators
 
-- Indigo Pulse: acquiring GPS
-- Blue (≈15 s): scanning loop
-- Green ×3: new match or ≥ 30s re‑detect
-- Blue Blink ×2: ≥ 5s re‑detect
+- Orange Pulse: Web configuration mode
+- Blue Pulse: Waiting for GPS
+- Purple Blink (≈15 s): Scanning heartbeat
+- Green Rapid ×3: New match detected or ≥ 30s re‑detect
+- Blue Blink x2: ≥ 5s re‑detect
 ---
 
 ## Notes and Tips
