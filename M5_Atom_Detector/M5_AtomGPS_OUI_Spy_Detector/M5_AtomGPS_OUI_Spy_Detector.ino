@@ -102,28 +102,39 @@ class MyAdvertisedDeviceCallbacks;
 #define ARDUINO_RUNNING_CORE 1
 #endif
 
-// LED Task - runs on Core 0
+// LED Task - runs on Core 0 with stack protection
 void LEDTask(void *pvParameters) {
   static unsigned long previousMillis = 0;
   static unsigned long patternStartTime = 0;
   static bool patternActive = false;
+  static bool statusBlinkState = false;
+  
+  // Add small delay to let system stabilize
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
   
   while (1) {
     unsigned long currentMillis = millis();
     
+    // Watch that stack
+    UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    if (stackHighWaterMark < 100) {
+      Serial.println("WARNING: LED Task stack low: " + String(stackHighWaterMark));
+    }
+    
     switch (currentLEDPattern) {
       case LED_OFF:
-        M5.dis.drawpix(0, 0x000000);  // Black
+        M5.dis.drawpix(0, 0x000000);
         patternActive = false;
         break;
         
       case LED_STATUS_BLINK:
         {
-          unsigned long interval = (currentMode == CONFIG_MODE) ? 10000 : 15000;
+          unsigned long interval = 2500;
           if (currentMillis - previousMillis >= interval) {
-            M5.dis.drawpix(0, 0xFFFFFF);  // White
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-            M5.dis.drawpix(0, 0x000000);  // Black
+            statusBlinkState = !statusBlinkState;
+            // Orange (0xA5FF00) in config mode, Blue (0xFF0000) in scanning mode  
+            uint32_t color = (currentMode == CONFIG_MODE) ? 0xA5FF00 : 0xFF0000;
+            M5.dis.drawpix(0, statusBlinkState ? color : 0x000000);
             previousMillis = currentMillis;
           }
         }
@@ -142,7 +153,7 @@ void LEDTask(void *pvParameters) {
             M5.dis.drawpix(0, 0x000000);  // Black
           } else {
             M5.dis.drawpix(0, 0x000000);
-            currentLEDPattern = LED_OFF;
+            currentLEDPattern = LED_STATUS_BLINK;
             patternActive = false;
           }
         }
@@ -162,12 +173,12 @@ void LEDTask(void *pvParameters) {
           } else if (elapsed < 300) {
             M5.dis.drawpix(0, 0x000000);
           } else if (elapsed < 450) {
-            M5.dis.drawpix(0, 0xFF0000);  // BLUE
+            M5.dis.drawpix(0, 0xFF0000); 
           } else if (elapsed < 600) {
             M5.dis.drawpix(0, 0x000000);
           } else {
             M5.dis.drawpix(0, 0x000000);
-            currentLEDPattern = LED_OFF;
+            currentLEDPattern = LED_STATUS_BLINK;
             patternActive = false;
           }
         }
@@ -196,7 +207,7 @@ void LEDTask(void *pvParameters) {
             M5.dis.drawpix(0, 0x000000);
           } else {
             M5.dis.drawpix(0, 0x000000);
-            currentLEDPattern = LED_OFF;
+            currentLEDPattern = LED_STATUS_BLINK;
             patternActive = false;
           }
         }
@@ -212,7 +223,7 @@ void LEDTask(void *pvParameters) {
           unsigned long elapsed = currentMillis - patternStartTime;
           if (elapsed > 2000) { // 2 second fade
             M5.dis.drawpix(0, 0x000000);
-            currentLEDPattern = LED_OFF;
+            currentLEDPattern = LED_STATUS_BLINK;
             patternActive = false;
           } else {
             // Simple purple fade
@@ -247,7 +258,7 @@ void LEDTask(void *pvParameters) {
         break;
     }
     
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    vTaskDelay(20 / portTICK_PERIOD_MS);
   }
 }
 
@@ -341,12 +352,27 @@ void startStatusBlinking() {
 }
 
 void waitForGPSFix() {
-  Serial.println("Waiting for GPS fix...");
+  Serial.println("Waiting for GPS fix... (Press button to bypass)");
+  
   while (REQUIRE_GPS_FIX && !gps.location.isValid()) {
+    // Update M5 to check button state
+    M5.update();
+    
+    // Check for button press to bypass GPS wait
+    if (M5.Btn.wasPressed()) {
+      Serial.println("Button pressed - bypassing GPS fix requirement");
+      stopGPSWaitPattern();
+      M5.dis.drawpix(0, 0x00FF00); // Green confirmation
+      delay(1500);
+      M5.dis.clear();
+      return;
+    }
+    
     while (Serial1.available() > 0) gps.encode(Serial1.read());
     startGPSWaitPattern(gps.satellites.value());
     delay(100);
   }
+  
   stopGPSWaitPattern();
   Serial.println("GPS fix obtained or bypassed.");
 }
@@ -383,7 +409,7 @@ void initializeFile() {
   int fileNumber = 0;
   bool isNewFile = false;
   do {
-    snprintf(fileName, sizeof(fileName), "/FoxHunt-%s%d.csv", dateStamp, fileNumber);
+    snprintf(fileName, sizeof(fileName), "/OUISPY-%s%d.csv", dateStamp, fileNumber);
     isNewFile = !SD.exists(fileName);
     fileNumber++;
   } while (!isNewFile);
@@ -868,6 +894,8 @@ void startConfigMode() {
   WiFi.mode(WIFI_AP);
   delay(500);
 
+  startStatusBlinking();
+
   bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
   if (!apStarted) {
     Serial.println("Failed to create Access Point!");
@@ -1155,13 +1183,16 @@ void setup() {
   xTaskCreatePinnedToCore(
     LEDTask,         // Function to implement the task
     "LEDTask",       // Name of the task
-    2048,            // Stack size in bytes
+    8192,            // Stack size in bytes
     NULL,            // Task input parameter
     1,               // Priority of the task
     &LEDTaskHandle,  // Task handle
     0                // Core where the task should run (0)
   );
 
+  Serial.println("Free heap at startup: " + String(ESP.getFreeHeap()));
+  Serial.println("Largest free block: " + String(ESP.getMaxAllocHeap()));
+  
 
   // Power down radio while doing SD init
   WiFi.mode(WIFI_OFF);
@@ -1308,13 +1339,6 @@ void loop() {
           lastConnectedMsg = currentMillis;
         }
       }
-    }
-
-    // Status blink in config mode every 10 seconds
-    static unsigned long lastConfigBlink = 0;
-    if (currentMillis - lastConfigBlink >= 10000) {
-      triggerSingleBlink();
-      lastConfigBlink = currentMillis;
     }
   }
 
