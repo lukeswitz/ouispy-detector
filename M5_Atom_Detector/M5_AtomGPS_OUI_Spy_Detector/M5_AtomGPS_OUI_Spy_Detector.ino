@@ -494,7 +494,7 @@ void performWiFiScan() {
   delay(100);
 
   // Use synchronous scan with timeout instead of async
-  int networksFound = WiFi.scanNetworks(false, false, false, 300);  // 300ms per channel
+  int networksFound = WiFi.scanNetworks(false, true, false, 110);  // 110 Per Nyquist formula thing, 
 
   if (networksFound == WIFI_SCAN_FAILED || networksFound < 0) {
     Serial.println("WiFi scan failed with code: " + String(networksFound));
