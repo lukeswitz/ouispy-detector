@@ -7,57 +7,67 @@
 #include <NimBLEAdvertisedDevice.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include <nvs_flash.h>
 #include <vector>
 #include <algorithm>
-#include <FastLED.h>
+#include <M5Atom.h>
 
-// ================================
+// FreeRTOS task handles
+TaskHandle_t LEDTaskHandle = NULL;
+TaskHandle_t ScanTaskHandle = NULL;
+
 // Hardware Configuration - M5 Atom Lite
-// ================================
-#define LED_PIN 27          // M5 Atom Lite RGB LED pin
-#define NUM_LEDS 1          // Single LED on Atom Lite
-#define LED_BRIGHTNESS 100  // 0-255, good visibility
+#define LED_PIN 27
+#define LED_BRIGHTNESS 80
+#define ATOM_LEDS 1
 
-// LED setup
-CRGB leds[NUM_LEDS];
-
-// ================================
 // WiFi AP Configuration
-// ================================
 #define AP_SSID "snoopuntothem"
 #define AP_PASSWORD "astheysnoopuntous"
 #define CONFIG_TIMEOUT 20000  // 20 seconds timeout for config mode
 
-// ================================
 // Operating Modes
-// ================================
 enum OperatingMode {
   CONFIG_MODE,
   SCANNING_MODE
 };
 
-// ================================
-// WiFi Scanning Configuration
-// ================================
-#define MAX_STORED_MACS 150
-char seenMacAddresses[MAX_STORED_MACS][18]; // Dedupe WiFi scanning
-int macCount = 0;
-int timePerChannel[14] = {200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 200, 50, 50, 50};
-int scanChannels[14] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0}; // US channels by default
-unsigned long lastWiFiScanTime = 0;
-const int WIFI_SCAN_INTERVAL = 10000;  // 10 seconds between WiFi scans
-bool wifiScanInProgress = false;
+// LED Color Reference (GRB format for M5Atom)
+// ==========================================
+// Bright Colors:
+// 0xFFFFFF - White
+// 0xFF0000 - Blue
+// 0x00FF00 - Green
+// 0x0000FF - Red
+// 0xFFFF00 - Cyan
+// 0x00FFFF - Yellow
+// 0xFF00FF - Magenta
+// 0xA5FF00 - Orange
+//
+// Dim Colors (good for status blinks):
+// 0x404040 - Warm White
+// 0x400040 - Dim Blue
+// 0x004000 - Dim Green
+// 0x000040 - Dim Red
+// 0x401040 - Dim Purple
+// 0x404020 - Dim Teal
+// 0x402040 - Dim Magenta
+// 0x204020 - Dim Yellow-Green
+// 0x602010 - Dim Orange
+// 0x301030 - Very Dim Purple
 
-// ================================
-// FreeRTOS Task Handles
-// ================================
-TaskHandle_t bleTaskHandle = NULL;
-TaskHandle_t wifiTaskHandle = NULL;
+// LED Pattern States
+enum LEDPattern {
+  LED_OFF,
+  LED_STATUS_BLINK,
+  LED_SINGLE_BLINK,  // Purple x1
+  LED_DOUBLE_BLINK,  // Blue x2
+  LED_TRIPLE_BLINK,  // Green x3
+  LED_READY_SIGNAL   // Purple fade
+};
 
-// ================================
 // Global Variables
-// ================================
 OperatingMode currentMode = CONFIG_MODE;
 AsyncWebServer server(80);
 Preferences preferences;
@@ -66,15 +76,13 @@ unsigned long configStartTime = 0;
 unsigned long lastConfigActivity = 0;
 unsigned long modeSwitchScheduled = 0;
 unsigned long deviceResetScheduled = 0;
-bool adaptiveScanEnabled = true;
+unsigned long lastWiFiScanTime = 0;
+const int WIFI_SCAN_INTERVAL = 10000;  // 10 seconds between WiFi scans
+bool wifiScanInProgress = false;
 
-
-// LED blink synchronization - avoid concurrent operations
-volatile bool newMatchFound = false;
-String detectedMAC = "";
-int detectedRSSI = 0;
-String matchedFilter = "";
-String matchType = "";  // "NEW", "RE-5s", "RE-30s"
+// LED control variables - accessed by both cores
+volatile LEDPattern currentLEDPattern = LED_OFF;
+volatile int ledPatternParam = 0;  // For extra parameters if needed
 
 // Device tracking
 struct DeviceInfo {
@@ -100,77 +108,332 @@ std::vector<TargetFilter> targetFilters;
 void startScanningMode();
 class MyAdvertisedDeviceCallbacks;
 
-// ================================
-// LED Pattern Functions
-// ================================
-void initializeLED() {
-  FastLED.addLeds<NEOPIXEL, LED_PIN>(leds, NUM_LEDS);
-  FastLED.setBrightness(LED_BRIGHTNESS);
-  FastLED.clear();
-  FastLED.show();
-}
+// FreeRTOS task definitions
+#if CONFIG_FREERTOS_UNICORE
+#define ARDUINO_RUNNING_CORE 0
+#else
+#define ARDUINO_RUNNING_CORE 1
+#endif
 
-void singleBlink() {
-  leds[0] = CRGB::Red;
-  FastLED.show();
-  delay(200);
-  leds[0] = CRGB::Black;
-  FastLED.show();
-}
+// LED Task - runs on Core 0 with stack protection
+void LEDTask(void* pvParameters) {
+  static unsigned long previousMillis = 0;
+  static unsigned long patternStartTime = 0;
+  static bool patternActive = false;
+  static bool statusBlinkState = false;
 
-void doubleBlink() {
-  // Two fast blue blinks for re-detection after 5+ seconds
-  for (int i = 0; i < 2; i++) {
-    leds[0] = CRGB::Blue;
-    FastLED.show();
-    delay(150);
-    leds[0] = CRGB::Black;
-    FastLED.show();
-    if (i < 1) delay(150);
+  // Add small delay to let system stabilize
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+  while (1) {
+    unsigned long currentMillis = millis();
+
+    // Watch that stack
+    UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    if (stackHighWaterMark < 100) {
+      Serial.println("WARNING: LED Task stack low: " + String(stackHighWaterMark));
+    }
+
+    switch (currentLEDPattern) {
+      case LED_OFF:
+        M5.dis.drawpix(0, 0x000000);
+        patternActive = false;
+        break;
+
+      case LED_STATUS_BLINK:
+        {
+          unsigned long interval = 2500;
+          if (currentMillis - previousMillis >= interval) {
+            statusBlinkState = !statusBlinkState;
+            uint32_t color = (currentMode == CONFIG_MODE) ? 0xA5FF00 : 0x401040;  // Orange : Dim Purple
+            M5.dis.drawpix(0, statusBlinkState ? color : 0x000000);
+            previousMillis = currentMillis;
+          }
+        }
+        break;
+
+      case LED_SINGLE_BLINK:  // Purple x1
+        if (!patternActive) {
+          patternStartTime = currentMillis;
+          patternActive = true;
+        }
+        {
+          unsigned long elapsed = currentMillis - patternStartTime;
+          if (elapsed <= 200) {
+            M5.dis.drawpix(0, 0x401040);
+          } else if (elapsed <= 400) {
+            M5.dis.drawpix(0, 0x000000);  // Black
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_STATUS_BLINK;
+            patternActive = false;
+          }
+        }
+        break;
+
+      case LED_DOUBLE_BLINK:  // Blue x2
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+
+          unsigned long elapsed = currentMillis - patternStartTime;
+
+          if (elapsed < 150) {
+            M5.dis.drawpix(0, 0xFF0000);
+          } else if (elapsed < 300) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 450) {
+            M5.dis.drawpix(0, 0xFF0000);
+          } else if (elapsed < 600) {
+            M5.dis.drawpix(0, 0x000000);
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_STATUS_BLINK;
+            patternActive = false;
+          }
+        }
+        break;
+
+      case LED_TRIPLE_BLINK:  // Green x3
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+
+          unsigned long elapsed = currentMillis - patternStartTime;
+
+          if (elapsed < 150) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN (GRB format)
+          } else if (elapsed < 300) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 450) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+          } else if (elapsed < 600) {
+            M5.dis.drawpix(0, 0x000000);
+          } else if (elapsed < 750) {
+            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+          } else if (elapsed < 900) {
+            M5.dis.drawpix(0, 0x000000);
+          } else {
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_STATUS_BLINK;
+            patternActive = false;
+          }
+        }
+        break;
+
+      case LED_READY_SIGNAL:
+        {
+          if (!patternActive) {
+            patternStartTime = currentMillis;
+            patternActive = true;
+          }
+
+          unsigned long elapsed = currentMillis - patternStartTime;
+          if (elapsed > 2000) {  // 2 second fade
+            M5.dis.drawpix(0, 0x000000);
+            currentLEDPattern = LED_STATUS_BLINK;
+            patternActive = false;
+          } else {
+            int brightness = (elapsed < 1000) ? (elapsed * 255 / 1000) : (255 - ((elapsed - 1000) * 255 / 1000));
+            uint32_t purple = (brightness << 8) | brightness;
+            M5.dis.drawpix(0, purple);
+          }
+        }
+        break;
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
   }
 }
 
-void tripleBlink() {
-  // Three fast green blinks for new device or re-detection after 30+ seconds
-  for (int i = 0; i < 3; i++) {
-    leds[0] = CRGB::Green;
-    FastLED.show();
-    delay(150);
-    leds[0] = CRGB::Black;
-    FastLED.show();
-    if (i < 2) delay(150);
+// Scanning Task - runs on Core 1
+void ScanTask(void* pvParameters) {
+  static unsigned long lastScanTime = 0;
+  static unsigned long lastCleanupTime = 0;
+  static unsigned long lastStatusTime = 0;
+
+  while (1) {
+    // Feed the watchdog to prevent timeout
+    esp_task_wdt_reset();
+
+    if (currentMode == SCANNING_MODE) {
+      unsigned long currentMillis = millis();
+
+      // Restart BLE scan every 3 seconds
+      if (currentMillis - lastScanTime >= 3000) {
+        if (pBLEScan) {
+          pBLEScan->stop();
+          vTaskDelay(10 / portTICK_PERIOD_MS);
+          pBLEScan->start(2, false, false);
+        }
+        lastScanTime = currentMillis;
+      }
+
+      // Start WiFi scan every 10 seconds if not already scanning
+      if (currentMillis - lastWiFiScanTime >= WIFI_SCAN_INTERVAL && !wifiScanInProgress) {
+        performWiFiScan();
+        lastWiFiScanTime = currentMillis;
+      }
+
+      // Clean up expired devices every 10 seconds
+      if (currentMillis - lastCleanupTime >= 10000) {
+        int devicesBefore = devices.size();
+        for (auto it = devices.begin(); it != devices.end();) {
+          if (currentMillis - it->lastSeen >= 60000) {
+            Serial.println("Removed expired device: " + it->macAddress);
+            it = devices.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        if (devices.size() != devicesBefore) {
+          Serial.println("Cleanup: Removed " + String(devicesBefore - devices.size()) + " expired devices");
+        }
+        lastCleanupTime = currentMillis;
+      }
+
+      // Status report every 30 seconds
+      if (currentMillis - lastStatusTime >= 30000) {
+        Serial.println("Status: Scanning - " + String(devices.size()) + " active devices tracked");
+        lastStatusTime = currentMillis;
+      }
+    }
+
+    vTaskDelay(200 / portTICK_PERIOD_MS);  // 200ms delay
   }
 }
 
-void readySignal() {
-  // Purple ascending brightness pattern to indicate "ready to scan"
-  for (int brightness = 0; brightness <= 150; brightness += 10) {
-    leds[0] = CRGB(brightness / 2, 0, brightness);  // Purple gradient
-    FastLED.show();
-    delay(50);
-  }
-  for (int brightness = 150; brightness >= 0; brightness -= 10) {
-    leds[0] = CRGB(brightness / 2, 0, brightness);
-    FastLED.show();
-    delay(50);
-  }
-  leds[0] = CRGB::Black;
-  FastLED.show();
-  delay(500);
+// LED Pattern Functions (now just set the pattern, don't block)
+void triggerSingleBlink() {
+  currentLEDPattern = LED_SINGLE_BLINK;
+}
+
+void triggerDoubleBlink() {
+  currentLEDPattern = LED_DOUBLE_BLINK;
+}
+
+void triggerTripleBlink() {
+  currentLEDPattern = LED_TRIPLE_BLINK;
+}
+
+void triggerReadySignal() {
+  currentLEDPattern = LED_READY_SIGNAL;
+}
+
+void startStatusBlinking() {
+  currentLEDPattern = LED_STATUS_BLINK;
 }
 
 void startupTest() {
-  // Quick LED test on startup
-  leds[0] = CRGB::White;
-  FastLED.show();
+  M5.dis.drawpix(0, 0xFFFFFF);  // White
   delay(300);
-  leds[0] = CRGB::Black;
-  FastLED.show();
+  M5.dis.drawpix(0, 0x000000);  // Black
 }
 
-// ================================
+// WiFi Scanning
+void performWiFiScan() {
+  if (wifiScanInProgress) return;
+
+  // Check WiFi mode before scanning
+  if (WiFi.getMode() != WIFI_STA) {
+    Serial.println("WiFi not in STA mode, fixing...");
+    WiFi.mode(WIFI_STA);
+    delay(200);
+  }
+
+  Serial.println("Starting WiFi scan...");
+  wifiScanInProgress = true;
+
+  WiFi.disconnect();
+  delay(100);
+
+  // Use synchronous scan with timeout instead of async
+  int networksFound = WiFi.scanNetworks(false, true, false, 110);  // 110ms per channel
+
+  if (networksFound == WIFI_SCAN_FAILED || networksFound < 0) {
+    Serial.println("WiFi scan failed with code: " + String(networksFound));
+    wifiScanInProgress = false;
+    return;
+  }
+
+  // Process results immediately since we're using sync scan
+  if (networksFound == 0) {
+    Serial.println("WiFi scan complete - no networks found");
+  } else {
+    Serial.println("WiFi scan complete, found " + String(networksFound) + " networks");
+    processWiFiResults(networksFound);
+  }
+
+  WiFi.scanDelete();
+  wifiScanInProgress = false;
+}
+
+void processWiFiResults(int networksFound) {
+  for (int i = 0; i < networksFound; i++) {
+    String bssid = WiFi.BSSIDstr(i);
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+
+    unsigned long currentMillis = millis();
+    String matchedDescription;
+    bool matchFound = matchesTargetFilter(bssid, matchedDescription);
+
+    if (!matchFound) continue;
+
+    bool known = false;
+    for (auto& dev : devices) {
+      if (dev.macAddress == bssid) {
+        known = true;
+
+        if (dev.inCooldown && currentMillis < dev.cooldownUntil) break;
+        if (dev.inCooldown && currentMillis >= dev.cooldownUntil) dev.inCooldown = false;
+
+        unsigned long dt = currentMillis - dev.lastSeen;
+
+        if (dt >= 30000) {
+          // Trigger LED pattern with WIFI indication
+          triggerTripleBlink();
+          Serial.println("WIFI RE-DETECTED after 30+ sec: " + matchedDescription);
+          Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+          dev.inCooldown = true;
+          dev.cooldownUntil = currentMillis + 10000;
+        } else if (dt >= 5000) {
+          triggerDoubleBlink();
+          Serial.println("WIFI RE-DETECTED after 5+ sec: " + matchedDescription);
+          Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+          dev.inCooldown = true;
+          dev.cooldownUntil = currentMillis + 5000;
+        }
+
+        dev.lastSeen = currentMillis;
+        break;
+      }
+    }
+
+    if (!known) {
+      DeviceInfo newDev{ bssid, rssi, currentMillis, currentMillis, false, 0, matchedDescription };
+      devices.push_back(newDev);
+
+      triggerTripleBlink();
+      Serial.println("NEW WIFI DEVICE DETECTED: " + matchedDescription);
+      Serial.println("MAC: " + bssid + " | SSID: " + ssid + " | RSSI: " + String(rssi));
+
+      auto& dev = devices.back();
+      dev.inCooldown = true;
+      dev.cooldownUntil = currentMillis + 5000;
+    }
+  }
+
+  // Free memory used by scan
+  WiFi.scanDelete();
+  wifiScanInProgress = false;
+}
+
 // MAC Address Utility Functions
-// ================================
 void normalizeMACAddress(String& mac) {
   mac.toLowerCase();
   mac.replace("-", ":");
@@ -222,9 +485,7 @@ bool matchesTargetFilter(const String& deviceMAC, String& matchedDescription) {
   return false;
 }
 
-// ================================
 // Configuration Storage Functions
-// ================================
 void saveConfiguration() {
   preferences.begin("ouispy", false);
   preferences.putInt("filterCount", targetFilters.size());
@@ -276,9 +537,7 @@ void loadConfiguration() {
   Serial.println("Configuration loaded - " + String(targetFilters.size()) + " filters");
 }
 
-// ================================
 // Web Server HTML Generation
-// ================================
 const char* getASCIIArt() {
   return R"(
    ____  __  ______                
@@ -329,9 +588,9 @@ String generateConfigHTML() {
   }
 
   String randomOUIExamples =
-      generateRandomOUI() + "\n" + generateRandomOUI() + "\n" + generateRandomOUI();
+    generateRandomOUI() + "\n" + generateRandomOUI() + "\n" + generateRandomOUI();
   String randomMACExamples =
-      generateRandomMAC() + "\n" + generateRandomMAC() + "\n" + generateRandomMAC();
+    generateRandomMAC() + "\n" + generateRandomMAC() + "\n" + generateRandomMAC();
 
   String html = R"html(
 <!DOCTYPE html>
@@ -434,11 +693,13 @@ String generateConfigHTML() {
         <h1>ATOM WiFi/BLE OUI-SPY</h1>
         
         <div class="status">
-            Configure MAC addresses and OUI prefixes to detect. LED patterns indicate detection type:
-            <br><strong>Green x 3:</strong> New device or re-detected after 30s
-            <br><strong>Blue x 2:</strong> Re-detected after 5s
-            <br><strong>Red x 1:</strong> Status blink
-        </div>
+    Configure MAC addresses and OUI prefixes to detect. LED patterns:
+    <br><strong>Green x3:</strong> New device or re-detected after 30s
+    <br><strong>Blue x2:</strong> Re-detected after 5s
+    <br><strong>Dim Purple:</strong> Steady scanning status blink
+    <br><strong>Orange:</strong> Configuration mode
+    <br><strong>Purple fade:</strong> Ready signal when switching modes
+</div>
 
         <form method="POST" action="/save">
             <div class="section">
@@ -503,7 +764,6 @@ String generateConfigHTML() {
   return html;
 }
 
-// Update handlers to send UTF-8 content type and make response page UTF-8 too
 void startConfigMode() {
   currentMode = CONFIG_MODE;
 
@@ -515,6 +775,8 @@ void startConfigMode() {
   delay(1000);
   WiFi.mode(WIFI_AP);
   delay(500);
+
+  startStatusBlinking();
 
   bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
   if (!apStarted) {
@@ -548,8 +810,14 @@ void startConfigMode() {
         int end = ouiData.indexOf('\n');
         while (start < ouiData.length()) {
           String oui;
-          if (end == -1) { oui = ouiData.substring(start); start = ouiData.length(); }
-          else { oui = ouiData.substring(start, end); start = end + 1; end = ouiData.indexOf('\n', start); }
+          if (end == -1) {
+            oui = ouiData.substring(start);
+            start = ouiData.length();
+          } else {
+            oui = ouiData.substring(start, end);
+            start = end + 1;
+            end = ouiData.indexOf('\n', start);
+          }
           oui.trim();
           oui.replace("\r", "");
           if (oui.length() > 0 && isValidMAC(oui)) {
@@ -571,8 +839,14 @@ void startConfigMode() {
         int end = macData.indexOf('\n');
         while (start < macData.length()) {
           String mac;
-          if (end == -1) { mac = macData.substring(start); start = macData.length(); }
-          else { mac = macData.substring(start, end); start = end + 1; end = macData.indexOf('\n', start); }
+          if (end == -1) {
+            mac = macData.substring(start);
+            start = macData.length();
+          } else {
+            mac = macData.substring(start, end);
+            start = end + 1;
+            end = macData.indexOf('\n', start);
+          }
           mac.trim();
           mac.replace("\r", "");
           if (mac.length() > 0 && isValidMAC(mac)) {
@@ -593,45 +867,45 @@ void startConfigMode() {
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <title>Configuration Saved</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px;
-            background: #0a0a0a; color: #ffffff; text-align: center;
-        }
-        .container {
-            max-width: 600px; margin: 0 auto;
-            background: rgba(255,255,255,0.03); padding: 40px;
-            border-radius: 12px; backdrop-filter: blur(8px);
-            border: 1px solid rgba(255, 107, 53, 0.3);
-        }
-        h1 { color: #ff6b35; margin-bottom: 30px; }
-        .success {
-            background: rgba(255, 107, 53, 0.2); color: #ff6b35;
-            border: 1px solid #ff6b35; padding: 20px; border-radius: 8px;
-            margin: 30px 0;
-        }
-    </style>
-    <script>
-        setTimeout(() => {
-            const el = document.getElementById('countdown');
-            if (el) el.innerHTML = 'Switching to scanning mode now...';
-        }, 5000);
-    </script>
+   <meta charset="UTF-8">
+   <title>Configuration Saved</title>
+   <meta name="viewport" content="width=device-width, initial-scale=1">
+   <style>
+       body {
+           font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px;
+           background: #0a0a0a; color: #ffffff; text-align: center;
+       }
+       .container {
+           max-width: 600px; margin: 0 auto;
+           background: rgba(255,255,255,0.03); padding: 40px;
+           border-radius: 12px; backdrop-filter: blur(8px);
+           border: 1px solid rgba(255, 107, 53, 0.3);
+       }
+       h1 { color: #ff6b35; margin-bottom: 30px; }
+       .success {
+           background: rgba(255, 107, 53, 0.2); color: #ff6b35;
+           border: 1px solid #ff6b35; padding: 20px; border-radius: 8px;
+           margin: 30px 0;
+       }
+   </style>
+   <script>
+       setTimeout(() => {
+           const el = document.getElementById('countdown');
+           if (el) el.innerHTML = 'Switching to scanning mode now...';
+       }, 5000);
+   </script>
 </head>
 <body>
-    <div class="container">
-        <h1>Configuration Saved</h1>
-        <div class="success">
-            <p><strong>Saved )html"
-          + String(targetFilters.size()) + R"html( filters successfully!</strong></p>
-            <p id="countdown">Switching to scanning mode in 5 seconds...</p>
-        </div>
-        <p>M5 Atom will now start scanning for your configured devices.</p>
-        <p>Watch for LED patterns when matches are found!</p>
-    </div>
+   <div class="container">
+       <h1>Configuration Saved</h1>
+       <div class="success">
+           <p><strong>Saved )html"
+                            + String(targetFilters.size()) + R"html( filters successfully!</strong></p>
+           <p id="countdown">Switching to scanning mode in 5 seconds...</p>
+       </div>
+       <p>M5 Atom will now start scanning for your configured devices.</p>
+       <p>Watch for LED patterns when matches are found!</p>
+   </div>
 </body>
 </html>
 )html";
@@ -653,239 +927,20 @@ void startConfigMode() {
   server.on("/device-reset", HTTP_POST, [](AsyncWebServerRequest* request) {
     lastConfigActivity = millis();
     request->send(
-        200, "text/html; charset=utf-8",
-        "<html><head><meta charset='UTF-8'></head>"
-        "<body style='background:#0a0a0a;color:#ff6b35;font-family:Arial;text-align:center;padding:50px;'>"
-        "<h1>Device Reset Complete</h1>"
-        "<p>Device restarting in 3 seconds...</p>"
-        "<script>setTimeout(function(){window.location.href='/'},5000);</script>"
-        "</body></html>");
+      200, "text/html; charset=utf-8",
+      "<html><head><meta charset='UTF-8'></head>"
+      "<body style='background:#0a0a0a;color:#ff6b35;font-family:Arial;text-align:center;padding:50px;'>"
+      "<h1>Device Reset Complete</h1>"
+      "<p>Device restarting in 3 seconds...</p>"
+      "<script>setTimeout(function(){window.location.href='/'},5000);</script>"
+      "</body></html>");
     deviceResetScheduled = millis() + 3000;
   });
   Serial.println("==Web server started===");
   server.begin();
 }
 
-// ================================
-// WiFi Scanning Functions
-// ================================
-bool isMACSeen(const char* mac) {
-  for (int i = 0; i < macCount; i++) {
-    if (strcmp(seenMacAddresses[i], mac) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void addToSeenMACs(const char* mac) {
-  if (macCount >= MAX_STORED_MACS) {
-    macCount = 0; // Reset when full (circular buffer)
-  }
-  strcpy(seenMacAddresses[macCount++], mac);
-}
-
-void scanWiFiNetworks() {
-  if (currentMode != SCANNING_MODE) return;
-  
-  // Scan each channel individually
-  for (int i = 0; i < 14; i++) {
-    int channel = scanChannels[i];
-    if (channel == 0) break; // End of channel list
-    
-    int numNetworks = WiFi.scanNetworks(false, true, false, timePerChannel[channel-1], channel);
-    
-    if (numNetworks > 0) {
-      Serial.println("Channel " + String(channel) + ": Found " + String(numNetworks) + " networks");
-      
-      // Process each network found
-      for (int n = 0; n < numNetworks; n++) {
-        String bssid = WiFi.BSSIDstr(n);
-        String ssid = WiFi.SSID(n);
-        int rssi = WiFi.RSSI(n);
-        
-        // Check if we've already seen this MAC
-        if (!isMACSeen(bssid.c_str())) {
-          addToSeenMACs(bssid.c_str());
-          
-          String matchedDescription;
-          bool matchFound = matchesTargetFilter(bssid, matchedDescription);
-          
-          if (matchFound) {
-            // We found a match for one of our targets
-            detectedMAC = bssid;
-            detectedRSSI = rssi;
-            matchedFilter = "WiFi: " + matchedDescription + " (SSID: " + ssid + ", CH: " + String(channel) + ")";
-            matchType = "WIFI-NEW";
-            newMatchFound = true;
-            
-            // Trigger the appropriate LED pattern in the main loop
-            tripleBlink();
-          }
-        }
-      }
-      
-      // Adaptive scan timing if needed
-      if (adaptiveScanEnabled) {
-        // More networks = spend more time on this channel next scan
-        if (numNetworks > 5) {
-          timePerChannel[channel-1] = min(timePerChannel[channel-1] + 50, 500);
-        } else if (numNetworks < 2) {
-          timePerChannel[channel-1] = max(timePerChannel[channel-1] - 20, 50);
-        }
-      }
-    }
-    
-    // Small delay between channels
-    delay(10);
-  }
-}
-
-void processWiFiScanResults() {
-  if (!wifiScanInProgress) return;
-  
-  int networksFound = WiFi.scanComplete();
-  
-  if (networksFound < 0) {
-    // Scan still in progress or failed
-    if (networksFound == WIFI_SCAN_FAILED) {
-      Serial.println("WiFi scan failed");
-      wifiScanInProgress = false;
-    }
-    return;
-  }
-  
-  // Scan completed successfully
-  Serial.println("WiFi scan complete, found " + String(networksFound) + " networks");
-  
-  unsigned long currentMillis = millis();
-  
-  for (int i = 0; i < networksFound; i++) {
-    String mac = WiFi.BSSIDstr(i);
-    String ssid = WiFi.SSID(i);
-    int rssi = WiFi.RSSI(i);
-    
-    String matchedDescription;
-    bool matchFound = matchesTargetFilter(mac, matchedDescription);
-    
-    if (!matchFound) continue;
-    
-    bool known = false;
-    for (auto& dev : devices) {
-      if (dev.macAddress == mac) {
-        known = true;
-        
-        if (dev.inCooldown && currentMillis < dev.cooldownUntil) break;
-        if (dev.inCooldown && currentMillis >= dev.cooldownUntil) dev.inCooldown = false;
-        
-        unsigned long dt = currentMillis - dev.lastSeen;
-        
-        if (dt >= 30000) {
-          // Set globals for the main loop to handle
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = "WiFi: " + matchedDescription + " (SSID: " + ssid + ")";
-          matchType = "WIFI-RE-30s";
-          newMatchFound = true;
-          dev.inCooldown = true;
-          dev.cooldownUntil = currentMillis + 10000;
-        } else if (dt >= 5000) {
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = "WiFi: " + matchedDescription + " (SSID: " + ssid + ")";
-          matchType = "WIFI-RE-5s";
-          newMatchFound = true;
-          dev.inCooldown = true;
-          dev.cooldownUntil = currentMillis + 5000;
-        }
-        
-        dev.lastSeen = currentMillis;
-        break;
-      }
-    }
-    
-    if (!known) {
-      DeviceInfo newDev{mac, rssi, currentMillis, currentMillis, false, 0, 
-                        "WiFi: " + matchedDescription + " (SSID: " + ssid + ")"};
-      devices.push_back(newDev);
-      
-      detectedMAC = mac;
-      detectedRSSI = rssi;
-      matchedFilter = "WiFi: " + matchedDescription + " (SSID: " + ssid + ")";
-      matchType = "WIFI-NEW";
-      newMatchFound = true;
-      
-      auto& dev = devices.back();
-      dev.inCooldown = true;
-      dev.cooldownUntil = currentMillis + 5000;
-    }
-  }
-  
-  // Free memory used by scan
-  WiFi.scanDelete();
-  wifiScanInProgress = false;
-}
-
-// ================================
-// FreeRTOS Task Functions
-// ================================
-// BLE scanning task - runs on Core 1
-void bleTask(void* parameter) {
-  Serial.println("BLE scanning task started on Core " + String(xPortGetCoreID()));
-  
-  unsigned long lastScanTime = 0;
-  
-  for (;;) {
-    if (currentMode == SCANNING_MODE) {
-      unsigned long currentMillis = millis();
-      
-      // Restart BLE scan every 3 seconds
-      if (currentMillis - lastScanTime >= 3000) {
-        if (pBLEScan) {
-          pBLEScan->stop();
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-          pBLEScan->start(2, false, false);
-        }
-        lastScanTime = currentMillis;
-      }
-    }
-    
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
-}
-
-// WiFi scanning task - runs on Core 0
-void wifiTask(void* parameter) {
-  Serial.println("WiFi scanning task started on Core " + String(xPortGetCoreID()));
-  
-  // Give time for system to stabilize
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
-  
-  // Ensure WiFi is properly initialized
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  vTaskDelay(500 / portTICK_PERIOD_MS);
-  
-  unsigned long lastScanTime = 0;
-  
-  for (;;) {
-    if (currentMode == SCANNING_MODE) {
-      unsigned long currentMillis = millis();
-      
-      // Scan every 5 seconds
-      if (currentMillis - lastScanTime >= 5000) {
-        scanWiFiNetworks();
-        lastScanTime = currentMillis;
-      }
-    }
-    
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-}
-
-// ================================
-// BLE Advertised Device Callback Class
-// ================================
+/// BLE Advertised Device Callback Class
 class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     if (currentMode != SCANNING_MODE) return;
@@ -909,21 +964,17 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
         unsigned long dt = currentMillis - dev.lastSeen;
 
         if (dt >= 30000) {
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = matchedDescription;
-          matchType = "RE-30s";
-          newMatchFound = true;
-          tripleBlink();
+          // Trigger LED pattern without blocking
+          triggerTripleBlink();
+          Serial.println("RE-DETECTED after 30+ sec: " + matchedDescription);
+          Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
           dev.inCooldown = true;
           dev.cooldownUntil = currentMillis + 10000;
         } else if (dt >= 5000) {
-          detectedMAC = mac;
-          detectedRSSI = rssi;
-          matchedFilter = matchedDescription;
-          matchType = "RE-5s";
-          newMatchFound = true;
-          doubleBlink();
+          // Trigger LED pattern without blocking
+          triggerDoubleBlink();
+          Serial.println("RE-DETECTED after 5+ sec: " + matchedDescription);
+          Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
           dev.inCooldown = true;
           dev.cooldownUntil = currentMillis + 5000;
         }
@@ -934,15 +985,13 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     }
 
     if (!known) {
-      DeviceInfo newDev{mac, rssi, currentMillis, currentMillis, false, 0, matchedDescription};
+      DeviceInfo newDev{ mac, rssi, currentMillis, currentMillis, false, 0, matchedDescription };
       devices.push_back(newDev);
 
-      detectedMAC = mac;
-      detectedRSSI = rssi;
-      matchedFilter = matchedDescription;
-      matchType = "NEW";
-      newMatchFound = true;
-      tripleBlink();
+      // Trigger LED pattern without blocking
+      triggerTripleBlink();
+      Serial.println("NEW DEVICE DETECTED: " + matchedDescription);
+      Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
 
       auto& dev = devices.back();
       dev.inCooldown = true;
@@ -956,7 +1005,19 @@ void startScanningMode() {
 
   server.end();
   WiFi.softAPdisconnect(true);
+
+  // More thorough WiFi shutdown and restart
   WiFi.mode(WIFI_OFF);
+  delay(1000);
+
+  // Restart WiFi subsystem
+  esp_wifi_stop();
+  delay(500);
+  esp_wifi_deinit();
+  delay(500);
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
   delay(500);
 
   Serial.println("\n=== STARTING M5 ATOM SCANNING MODE ===");
@@ -966,7 +1027,7 @@ void startScanningMode() {
   }
   Serial.println("==============================\n");
 
-  // Initialize BLE scanning
+  // Initialize BLE scanning first
   NimBLEDevice::init("");
   delay(1000);
 
@@ -978,73 +1039,87 @@ void startScanningMode() {
     pBLEScan->setScanCallbacks(new MyAdvertisedDeviceCallbacks());
   }
 
-  // Initialize WiFi for scanning
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
+  // Initialize WiFi for scanning with multiple attempts
+  bool wifiReady = false;
+  for (int attempt = 0; attempt < 3 && !wifiReady; attempt++) {
+    Serial.println("WiFi initialization attempt " + String(attempt + 1));
+
+    WiFi.mode(WIFI_STA);
+    delay(1000);
+    WiFi.disconnect();
+    delay(500);
+
+    // Test scan with timeout
+    Serial.println("Testing WiFi scan capability...");
+    int testResult = WiFi.scanNetworks(false, false, false, 300);  // 300ms per channel, sync scan
+
+    Serial.println("Test scan result: " + String(testResult));
+
+    if (testResult >= 0) {  // 0 or positive means success
+      Serial.println("WiFi scan test successful - found " + String(testResult) + " networks");
+      WiFi.scanDelete();
+      wifiReady = true;
+    } else {
+      Serial.println("WiFi scan test failed with code: " + String(testResult));
+      WiFi.mode(WIFI_OFF);
+      delay(1000);
+    }
+  }
+
+  if (!wifiReady) {
+    Serial.println("WARNING: WiFi scanning may not work properly");
+  }
+
   delay(500);
-  
-  // Clear MAC storage
-  memset(seenMacAddresses, 0, sizeof(seenMacAddresses));
-  macCount = 0;
-
-  // Create BLE scanning task on Core 1 (application core)
-  xTaskCreatePinnedToCore(
-    bleTask,           // Task function
-    "BLETask",         // Name of task
-    4096,              // Stack size of task
-    NULL,              // Parameter of the task
-    1,                 // Priority of the task
-    &bleTaskHandle,    // Task handle to track the task
-    1                  // Core where the task should run (1 = application core)
-  );
-
-  // Create WiFi scanning task on Core 0 (protocol core)
-  xTaskCreatePinnedToCore(
-    wifiTask,          // Task function
-    "WiFiTask",        // Name of task
-    4096,              // Stack size of task
-    NULL,              // Parameter of the task
-    1,                 // Priority of the task
-    &wifiTaskHandle,   // Task handle to track the task
-    0                  // Core where the task should run (0 = protocol core)
-  );
-
-  delay(500);
-  readySignal();
+  triggerReadySignal();
   delay(2000);
 
   if (pBLEScan != nullptr) {
     pBLEScan->start(3, false, false);
     Serial.println("BLE scanning started!");
   }
-  
-  Serial.println("WiFi scanning started!");
-  adaptiveScanEnabled = true;
+
+  Serial.println("WiFi scanning ready!");
+  lastWiFiScanTime = 0;  // Force WiFi scan immediately
+  wifiScanInProgress = false;
+
+  startStatusBlinking();  // Start status blinking pattern
 }
 
-// ================================
-// Setup Function
-// ================================
 void setup() {
   delay(2000);
-
-  // Initialize Serial
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n\n=== ATOM WiFi/BLE OUI-SPY ===");
-  Serial.println("LED: GPIO27 (Single RGB LED)");
-  Serial.println("Mode: Multi-target BLE device detection");
-  Serial.println("Patterns: Green×3 (new), Blue×2 (5s), Red×1 (status)");
-  Serial.println("Initializing...\n");
+  M5.begin(true, false, true);
+  delay(50);
 
-  // Initialize LED
-  initializeLED();
-
-  // Startup LED test
   startupTest();
 
-  // Randomize MAC address for stealth
+  // Create LED task on Core 1 (away from WiFi interference)
+  xTaskCreatePinnedToCore(
+    LEDTask,         // Function to implement the task
+    "LEDTask",       // Name of the task
+    4096,            // Stack size in bytes
+    NULL,            // Task input parameter
+    3,               // Higher priority than scanning
+    &LEDTaskHandle,  // Task handle
+    1                // Core 1 (app core)
+  );
+
+  Serial.println("Free heap at startup: " + String(ESP.getFreeHeap()));
+  Serial.println("Largest free block: " + String(ESP.getMaxAllocHeap()));
+
+  // Power down radio while doing initial setup
+  WiFi.mode(WIFI_OFF);
+
+  Serial.println("\n\n=== ATOM WiFi/BLE OUI-SPY ===");
+  Serial.println("LED: GPIO27 (Single RGB LED)");
+  Serial.println("Mode: Multi-target BLE/WiFi device detection");
+  Serial.println("Patterns: Green×3 (new), Blue×2 (5s), Purple×1 (status)");
+  Serial.println("Initializing...\n");
+
+  // Randomize MAC address
   uint8_t newMAC[6];
   WiFi.macAddress(newMAC);
 
@@ -1087,11 +1162,9 @@ void setup() {
 
   if (factoryReset) {
     Serial.println("FACTORY RESET FLAG DETECTED - Clearing all data...");
-
     preferences.begin("ouispy", false);
     preferences.clear();
     preferences.end();
-
     targetFilters.clear();
     Serial.println("Factory reset complete - starting with clean state");
   } else {
@@ -1099,29 +1172,32 @@ void setup() {
     loadConfiguration();
   }
 
-  // Start in configuration mode
+  // Configuration AP and web UI
   Serial.println("Starting configuration mode...");
   startConfigMode();
+
+  // Create scanning task on Core 0 with LOW priority
+  xTaskCreatePinnedToCore(
+    ScanTask,         // Function to implement the task
+    "ScanTask",       // Name of the task
+    8192,             // Stack size in bytes
+    NULL,             // Task input parameter
+    1,                // LOW priority - below WiFi/BLE tasks
+    &ScanTaskHandle,  // Task handle
+    0                 // Core 0
+  );
 }
 
-// ================================
-// Loop Function
-// ================================
 void loop() {
-  static unsigned long lastCleanupTime = 0;
-  static unsigned long lastStatusTime = 0;
-  static unsigned long lastStatusBlink = 0;
   unsigned long currentMillis = millis();
 
   if (currentMode == CONFIG_MODE) {
     // Handle scheduled device reset
     if (deviceResetScheduled > 0 && currentMillis >= deviceResetScheduled) {
       Serial.println("Scheduled device reset - setting factory reset flag and restarting...");
-
       preferences.begin("ouispy", false);
       preferences.putBool("factoryReset", true);
       preferences.end();
-
       delay(500);
       ESP.restart();
     }
@@ -1136,18 +1212,15 @@ void loop() {
 
     // Config timeout logic
     if (targetFilters.size() == 0) {
-      // No saved filters - stay in config mode
       if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
         Serial.println("No saved filters - staying in config mode indefinitely");
         Serial.println("Connect to 'snoopuntothem' AP to configure filters!");
       }
     } else if (targetFilters.size() > 0) {
-      // Have saved filters - timeout if no one connected
       if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
         Serial.println("No connection within 20s - using saved filters, switching to scanning");
         startScanningMode();
       } else if (lastConfigActivity > configStartTime) {
-        // Someone connected - wait for submission
         static unsigned long lastConnectedMsg = 0;
         if (currentMillis - configStartTime > CONFIG_TIMEOUT && currentMillis - lastConnectedMsg > 30000) {
           Serial.println("Web interface connected - waiting for configuration...");
@@ -1155,80 +1228,7 @@ void loop() {
         }
       }
     }
-
-    // Status blink in config mode every 10 seconds
-    if (currentMillis - lastStatusBlink >= 10000) {
-      singleBlink();
-      lastStatusBlink = currentMillis;
-    }
-
-    delay(100);
-    return;
   }
 
-  // Scanning mode loop
-  if (currentMode == SCANNING_MODE) {
-    // Handle match detection messages
-    if (newMatchFound) {
-      bool isWifi = matchType.startsWith("WIFI");
-      
-      Serial.println(">> Match found! (" + String(isWifi ? "WiFi" : "BLE") + ") <<");
-      Serial.print("Device: " + detectedMAC);
-      Serial.print(" | RSSI: " + String(detectedRSSI));
-      Serial.println(" | Filter: " + matchedFilter);
-
-      // Trigger appropriate LED pattern based on match type
-      if (matchType.endsWith("NEW")) {
-        Serial.println((isWifi ? "NEW WIFI" : "NEW BLE") + String(" DEVICE DETECTED: ") + matchedFilter);
-        tripleBlink();
-      } else if (matchType.endsWith("RE-30s")) {
-        Serial.println((isWifi ? "WIFI" : "BLE") + String(" RE-DETECTED after 30+ sec: ") + matchedFilter);
-        tripleBlink();
-      } else if (matchType.endsWith("RE-5s")) {
-        Serial.println((isWifi ? "WIFI" : "BLE") + String(" RE-DETECTED after 5+ sec: ") + matchedFilter);
-        doubleBlink();
-      }
-
-      Serial.println("==============================");
-      newMatchFound = false;
-    }
-
-    // Clean up expired devices every 10 seconds
-    if (currentMillis - lastCleanupTime >= 10000) {
-      int devicesBefore = devices.size();
-
-      for (auto it = devices.begin(); it != devices.end();) {
-        if (currentMillis - it->lastSeen >= 60000) {
-          Serial.println("Removed expired device: " + it->macAddress);
-          it = devices.erase(it);
-        } else {
-          ++it;
-        }
-      }
-
-      if (devices.size() != devicesBefore) {
-        Serial.println("Cleanup: Removed " + String(devicesBefore - devices.size()) + " expired devices");
-      }
-
-      lastCleanupTime = currentMillis;
-    }
-
-    // Status report every 30 seconds
-    if (currentMillis - lastStatusTime >= 30000) {
-      Serial.println("Status: Scanning BLE+WiFi - " + String(devices.size()) + " active devices tracked");
-      lastStatusTime = currentMillis;
-    }
-
-    // Subtle status blink every 15 seconds in scanning mode
-    if (currentMillis - lastStatusBlink >= 15000) {
-      leds[0] = CRGB(10, 10, 10);  // Dim white
-      FastLED.show();
-      delay(50);
-      leds[0] = CRGB::Black;
-      FastLED.show();
-      lastStatusBlink = currentMillis;
-    }
-  }
-
-  delay(50);
+  delay(100);
 }
