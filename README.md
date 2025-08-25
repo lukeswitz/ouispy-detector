@@ -11,7 +11,9 @@ Professional BLE scanning system that detects specific devices by MAC address or
 - Integrated buzzer and power management
 - Ready-to-use, no additional components required
 
-**Alternative:** Standard ESP32-S3 with external buzzer on GPIO3
+**Alternatives:**
+- [M5 Atom Lite/GPS](https://github.com/lukeswitz/ouispy-detector/tree/main/M5_Atom_Detector) WiFi + BLE, logging & location FW
+- Standard ESP32-S3 with external buzzer on GPIO3
 
 ## Quick Start
 
