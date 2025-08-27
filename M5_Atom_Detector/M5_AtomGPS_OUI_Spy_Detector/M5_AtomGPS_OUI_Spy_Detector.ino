@@ -19,6 +19,7 @@
 // FreeRTOS task handles
 TaskHandle_t LEDTaskHandle = NULL;
 TaskHandle_t ScanTaskHandle = NULL;
+const size_t MAX_DEVICES = 100;
 
 // Hardware Configuration - M5 Atom Lite
 #define LED_PIN 27
@@ -74,9 +75,9 @@ enum LEDPattern {
   LED_STATUS_BLINK,
   LED_SINGLE_BLINK,  // Purple x1
   LED_DOUBLE_BLINK,  // Blue x2
-  LED_TRIPLE_BLINK,  // Green x3
-  LED_READY_SIGNAL,  // Purple fade
-  LED_GPS_WAIT       // Purple variable brightness
+  LED_TRIPLE_BLINK,  // Red x3 for new device alert
+  LED_READY_SIGNAL,  // Purple/Blue fade
+  LED_GPS_WAIT       // Blue variable brightness
 };
 
 // Global Variables
@@ -208,7 +209,7 @@ void LEDTask(void* pvParameters) {
         }
         break;
 
-      case LED_TRIPLE_BLINK:  // Green x3
+      case LED_TRIPLE_BLINK:  // Red x3
         {
           if (!patternActive) {
             patternStartTime = currentMillis;
@@ -218,15 +219,15 @@ void LEDTask(void* pvParameters) {
           unsigned long elapsed = currentMillis - patternStartTime;
 
           if (elapsed < 150) {
-            M5.dis.drawpix(0, 0x00FF00);  // GREEN (GRB format)
+            M5.dis.drawpix(0, 0x00FF00); 
           } else if (elapsed < 300) {
             M5.dis.drawpix(0, 0x000000);
           } else if (elapsed < 450) {
-            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+            M5.dis.drawpix(0, 0x00FF00); 
           } else if (elapsed < 600) {
             M5.dis.drawpix(0, 0x000000);
           } else if (elapsed < 750) {
-            M5.dis.drawpix(0, 0x00FF00);  // GREEN
+            M5.dis.drawpix(0, 0x00FF00);
           } else if (elapsed < 900) {
             M5.dis.drawpix(0, 0x000000);
           } else {
@@ -251,7 +252,7 @@ void LEDTask(void* pvParameters) {
             patternActive = false;
           } else {
             int brightness = (elapsed < 1000) ? (elapsed * 255 / 1000) : (255 - ((elapsed - 1000) * 255 / 1000));
-            uint32_t purple = (brightness << 8) | brightness; 
+            uint32_t purple = (brightness << 8) | brightness;
             M5.dis.drawpix(0, purple);
           }
         }
@@ -288,34 +289,24 @@ void LEDTask(void* pvParameters) {
 // Scanning Task - runs on Core 1
 void ScanTask(void* pvParameters) {
   static unsigned long lastScanTime = 0;
-  static unsigned long lastCleanupTime = 0;
+  static unsigned long lastBLECleanupTime = 0;     // Separate timer for BLE
+  static unsigned long lastDeviceCleanupTime = 0;  // Separate timer for device list
   static unsigned long lastStatusTime = 0;
 
   while (1) {
-    // Feed the watchdog to prevent timeout
-    esp_task_wdt_reset();
-
     if (currentMode == SCANNING_MODE) {
       unsigned long currentMillis = millis();
 
-      // Restart BLE scan every 3 seconds
-      if (currentMillis - lastScanTime >= 3000) {
+      // BLE cleanup every 30 seconds
+      if (currentMillis - lastBLECleanupTime >= 30000) {
         if (pBLEScan) {
-          pBLEScan->stop();
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-          pBLEScan->start(2, false, false);
+          pBLEScan->clearResults();
         }
-        lastScanTime = currentMillis;
+        lastBLECleanupTime = currentMillis;
       }
 
-      // Start WiFi scan every 10 seconds if not already scanning
-      if (currentMillis - lastWiFiScanTime >= WIFI_SCAN_INTERVAL && !wifiScanInProgress) {
-        performWiFiScan();
-        lastWiFiScanTime = currentMillis;
-      }
-
-      // Clean up expired devices every 10 seconds
-      if (currentMillis - lastCleanupTime >= 10000) {
+      // Device list cleanup every 10 seconds
+      if (currentMillis - lastDeviceCleanupTime >= 10000) {
         int devicesBefore = devices.size();
         for (auto it = devices.begin(); it != devices.end();) {
           if (currentMillis - it->lastSeen >= 60000) {
@@ -328,8 +319,26 @@ void ScanTask(void* pvParameters) {
         if (devices.size() != devicesBefore) {
           Serial.println("Cleanup: Removed " + String(devicesBefore - devices.size()) + " expired devices");
         }
-        lastCleanupTime = currentMillis;
+        lastDeviceCleanupTime = currentMillis;
       }
+
+      // Restart BLE scan every 3 seconds
+      if (currentMillis - lastScanTime >= 1000) {
+        if (pBLEScan) {
+          pBLEScan->stop();
+          vTaskDelay(10 / portTICK_PERIOD_MS);
+          pBLEScan->start(0.8, false, false);  
+        }
+        lastScanTime = currentMillis;
+      }
+
+      // Start WiFi scan every 10 seconds if not already scanning
+      if (currentMillis - lastWiFiScanTime >= WIFI_SCAN_INTERVAL && !wifiScanInProgress) {
+        performWiFiScan();
+        lastWiFiScanTime = currentMillis;
+      }
+
+
 
       // Status report every 30 seconds
       if (currentMillis - lastStatusTime >= 30000) {
@@ -420,6 +429,11 @@ bool initSD() {
 }
 
 void initializeFile() {
+  if (!sdReady) {
+    Serial.println("SD not ready in initializeFile!");
+    return;
+  }
+
   int y = gps.date.isValid() ? gps.date.year() : 1970;
   int m = gps.date.isValid() ? gps.date.month() : 1;
   int d = gps.date.isValid() ? gps.date.day() : 1;
@@ -428,25 +442,36 @@ void initializeFile() {
   sprintf(dateStamp, "%04d-%02d-%02d-", y, m, d);
 
   int fileNumber = 0;
-  bool isNewFile = false;
   do {
     snprintf(fileName, sizeof(fileName), "/OUISPY-%s%d.csv", dateStamp, fileNumber);
-    isNewFile = !SD.exists(fileName);
     fileNumber++;
-  } while (!isNewFile);
+  } while (SD.exists(fileName) && fileNumber < 999);
 
   File f = SD.open(fileName, FILE_WRITE);
-  if (f) {
-    f.println("WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter");
-    f.close();
-    Serial.println(String("Log file: ") + fileName);
-  } else {
-    Serial.println("Failed to create log file.");
+  if (!f) {
+    Serial.println("Failed to create log file!");
+    sdReady = false;
+    return;
   }
+
+  f.println("WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter");
+  f.close();
+
+  // Verify file was created
+  if (!SD.exists(fileName)) {
+    Serial.println("File creation failed!");
+    sdReady = false;
+    return;
+  }
+
+  Serial.println("Log file created: " + String(fileName));
 }
 
 void logMatchRow(const String& type, const String& mac, int rssi, const String& filt) {
-  if (!sdReady) return;
+  if (!sdReady || !SD.exists(fileName)) {
+    Serial.println("SD or file not ready!");
+    return;
+  }
 
   char utc[21];
   if (gps.date.isValid() && gps.time.isValid()) {
@@ -454,25 +479,32 @@ void logMatchRow(const String& type, const String& mac, int rssi, const String& 
             gps.date.year(), gps.date.month(), gps.date.day(),
             gps.time.hour(), gps.time.minute(), gps.time.second());
   } else {
-    sprintf(utc, "1970-01-01 00:00:00");
+    strcpy(utc, "1970-01-01 00:00:00");
   }
 
-  double lat = gps.location.isValid() ? gps.location.lat() : 0.0;
-  double lon = gps.location.isValid() ? gps.location.lng() : 0.0;
-  double alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
-  double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : -1.0;
-
+  // Create the line before opening file
   char line[512];
   snprintf(line, sizeof(line),
-           "%s,%s,%s,%d,%.6f,%.6f,%.2f,%.2f,%s",
-           utc, type.c_str(), mac.c_str(), rssi, lat, lon, alt, hdop, filt.c_str());
+           "%s,%s,%s,%d,%.6f,%.6f,%.2f,%.2f,%s\n",
+           utc, type.c_str(), mac.c_str(), rssi,
+           gps.location.isValid() ? gps.location.lat() : 0.0,
+           gps.location.isValid() ? gps.location.lng() : 0.0,
+           gps.altitude.isValid() ? gps.altitude.meters() : 0.0,
+           gps.hdop.isValid() ? gps.hdop.hdop() : -1.0,
+           filt.c_str());
 
+  // Open file with explicit close
   File f = SD.open(fileName, FILE_APPEND);
-  if (f) {
-    f.println(line);
-    f.close();
-  } else {
-    Serial.println(String("Error opening ") + fileName);
+  if (!f) {
+    Serial.println("Failed to open log file!");
+    return;
+  }
+
+  size_t bytesWritten = f.print(line);
+  f.close();
+
+  if (bytesWritten != strlen(line)) {
+    Serial.println("Warning: Incomplete write to SD!");
   }
 }
 
@@ -480,21 +512,31 @@ void logMatchRow(const String& type, const String& mac, int rssi, const String& 
 void performWiFiScan() {
   if (wifiScanInProgress) return;
 
-  // Check WiFi mode before scanning
-  if (WiFi.getMode() != WIFI_STA) {
-    Serial.println("WiFi not in STA mode, fixing...");
-    WiFi.mode(WIFI_STA);
-    delay(200);
-  }
+  // Full WiFi reset and initialization sequence
+  WiFi.disconnect(true, true);  // Disconnect and erase stored credentials
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  delay(100);
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  esp_wifi_init(&cfg);
+  esp_wifi_start();
+  delay(100);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);
 
   Serial.println("Starting WiFi scan...");
   wifiScanInProgress = true;
 
-  WiFi.disconnect();
-  delay(100);
-
-  // Use synchronous scan with timeout instead of async
-  int networksFound = WiFi.scanNetworks(false, true, false, 110);  // 110 Per Nyquist formula thing, 
+  int networksFound = WiFi.scanNetworks(false,  // async
+                                        true,   // show hidden
+                                        false,  // passive scan
+                                        500,    // max ms per channel
+                                        0);     // channel 0 = scan all channels
 
   if (networksFound == WIFI_SCAN_FAILED || networksFound < 0) {
     Serial.println("WiFi scan failed with code: " + String(networksFound));
@@ -502,11 +544,10 @@ void performWiFiScan() {
     return;
   }
 
-  // Process results immediately since we're using sync scan
   if (networksFound == 0) {
-    Serial.println("WiFi scan complete - no networks found");
+    Serial.println("No networks found");
   } else {
-    Serial.println("WiFi scan complete, found " + String(networksFound) + " networks");
+    Serial.println(String(networksFound) + " networks found");
     processWiFiResults(networksFound);
   }
 
@@ -1100,9 +1141,21 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     int rssi = advertisedDevice->getRSSI();
     unsigned long currentMillis = millis();
 
+    // Debug output for all devices
+    Serial.printf("BLE Device: MAC=%s, RSSI=%d", mac.c_str(), rssi);
+    if (advertisedDevice->haveName()) {
+      Serial.printf(", Name=%s", advertisedDevice->getName().c_str());
+    }
+    Serial.println();
+
     String matchedDescription;
     bool matchFound = matchesTargetFilter(mac, matchedDescription);
-    if (!matchFound) return;
+
+    // // Debug the matching process
+    // if (!matchFound) {
+    //   Serial.println("No match for: " + mac);
+    //   return;
+    // }
 
     bool known = false;
     for (auto& dev : devices) {
@@ -1115,7 +1168,6 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
         unsigned long dt = currentMillis - dev.lastSeen;
 
         if (dt >= 30000) {
-          // Trigger LED pattern without blocking
           triggerTripleBlink();
           Serial.println("RE-DETECTED after 30+ sec: " + matchedDescription);
           Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
@@ -1123,7 +1175,6 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
           dev.inCooldown = true;
           dev.cooldownUntil = currentMillis + 10000;
         } else if (dt >= 5000) {
-          // Trigger LED pattern without blocking
           triggerDoubleBlink();
           Serial.println("RE-DETECTED after 5+ sec: " + matchedDescription);
           Serial.println("MAC: " + mac + " | RSSI: " + String(rssi));
@@ -1138,6 +1189,8 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     }
 
     if (!known) {
+      if (devices.size() >= MAX_DEVICES) { devices.erase(devices.begin()); }  // Prevent overflow
+
       DeviceInfo newDev{ mac, rssi, currentMillis, currentMillis, false, 0, matchedDescription };
       devices.push_back(newDev);
 
@@ -1160,18 +1213,21 @@ void startScanningMode() {
   server.end();
   WiFi.softAPdisconnect(true);
 
-  // More thorough WiFi shutdown and restart
+  // Full WiFi reset
+  WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
-  delay(1000);
-
-  // Restart WiFi subsystem
-  esp_wifi_stop();
   delay(500);
+
+  esp_wifi_stop();
   esp_wifi_deinit();
   delay(500);
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
+  esp_wifi_start();
+  delay(500);
+
+  WiFi.mode(WIFI_STA);
   delay(500);
 
   Serial.println("\n=== STARTING M5 ATOM SCANNING MODE ===");
@@ -1181,48 +1237,22 @@ void startScanningMode() {
   }
   Serial.println("==============================\n");
 
-  // Initialize BLE scanning first
+  // Initialize BLE scanning
   NimBLEDevice::init("");
   delay(1000);
 
   pBLEScan = NimBLEDevice::getScan();
   if (pBLEScan != nullptr) {
-    pBLEScan->setActiveScan(true);
-    pBLEScan->setInterval(300);
-    pBLEScan->setWindow(200);
+    pBLEScan->clearResults();
+    pBLEScan->setActiveScan(true);  // Get more data including device names
+    pBLEScan->setInterval(100);     // Reduced from 300 - scan more frequently
+    pBLEScan->setWindow(99);        // Almost continuous scanning
     pBLEScan->setScanCallbacks(new MyAdvertisedDeviceCallbacks());
   }
 
-  // Initialize WiFi for scanning with multiple attempts
-  bool wifiReady = false;
-  for (int attempt = 0; attempt < 3 && !wifiReady; attempt++) {
-    Serial.println("WiFi initialization attempt " + String(attempt + 1));
-
-    WiFi.mode(WIFI_STA);
-    delay(1000);
-    WiFi.disconnect();
-    delay(500);
-
-    // Test scan with timeout
-    Serial.println("Testing WiFi scan capability...");
-    int testResult = WiFi.scanNetworks(false, false, false, 300);  // 300ms per channel, sync scan
-
-    Serial.println("Test scan result: " + String(testResult));
-
-    if (testResult >= 0) {  // 0 or positive means success
-      Serial.println("WiFi scan test successful - found " + String(testResult) + " networks");
-      WiFi.scanDelete();
-      wifiReady = true;
-    } else {
-      Serial.println("WiFi scan test failed with code: " + String(testResult));
-      WiFi.mode(WIFI_OFF);
-      delay(1000);
-    }
-  }
-
-  if (!wifiReady) {
-    Serial.println("WARNING: WiFi scanning may not work properly");
-  }
+  Serial.println("WiFi initialized in STA mode");
+  lastWiFiScanTime = 0;
+  wifiScanInProgress = false;
 
   delay(500);
   triggerReadySignal();
@@ -1234,10 +1264,7 @@ void startScanningMode() {
   }
 
   Serial.println("WiFi scanning ready!");
-  lastWiFiScanTime = 0;  // Force WiFi scan immediately
-  wifiScanInProgress = false;
-
-  startStatusBlinking();  // Start status blinking pattern
+  startStatusBlinking();
 }
 
 void setup() {
@@ -1350,7 +1377,7 @@ void setup() {
     Serial.println("SD not ready, logging disabled.");
   }
 
-  // Configuration AP and web UI
+  // Configuration AP and web UI after GPS..
   Serial.println("Starting configuration mode...");
   startConfigMode();
 
