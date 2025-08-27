@@ -1,4 +1,4 @@
-# OUI‑Spy Detector 
+# M5 OUI‑Spy 
 ### (BLE + Wi‑Fi) — M5Stack ATOM (Lite / ATOM GPS)
 
 Unified (beta) detector firmware for multi‑target BLE and Wi‑Fi with GPS+SD logging and Web configuration.
@@ -47,7 +47,7 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
 
 1) Insert FAT32 microSD, power on  
 2) Wait for GPS (purple LED blink; speeds up with satellites)  
-3) Connect to SoftAP:
+3) Connect to AP:
    - SSID: `snoopuntothem`
    - Password: `astheysnoopuntous`
    - Open the IP printed to Serial to access Web UI
@@ -55,16 +55,28 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
    - OUI: `58:2D:34`
    - Full MAC: `58:2D:34:12:AB:CD`
 5) Device scans; new/rediscovered matches blink and log to:
-   - `/FoxHunt-YYYY-MM-DD-N.csv`
+   - `/OUISPY-YYYY-MM-DD-N.csv`
 
 ---
+
+
+## LED Indicators
+
+| LED Behavior | Meaning |
+|--------------|---------|
+| Purple Blink | Scanning heartbeat |
+| Blue Blink x2 | ≥ 5s re‑detect|
+| Orange Pulse | Web config mode |
+| Green Blink x3 | Target acquired for the first time or ≥ 30s re‑detect |
+| Blue Pulse | Waiting for GPS fix (pulses faster with more satellites) |
+
 
 ## LED Indicators
 
 - Orange Pulse: Web configuration mode
 - Blue Pulse: Waiting for GPS
 - Purple Blink (≈15 s): Scanning heartbeat
-- Green Rapid ×3: New match detected or ≥ 30s re‑detect
+- Green Rapid ×3: New match detected 
 - Blue Blink x2: ≥ 5s re‑detect
 ---
 
