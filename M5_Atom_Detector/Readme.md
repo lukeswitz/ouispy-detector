@@ -65,9 +65,9 @@ WhenUTC,MatchType,MAC,RSSI,Lat,Lon,AltM,HDOP,Filter
 | LED Behavior | Meaning |
 |--------------|---------|
 | Purple Blink | Scanning heartbeat |
-| Blue Blink x2 | ≥ 5s re‑detect|
+| Red Blink x2 | ≥ 5s re‑detect|
 | Orange Pulse | Web config mode |
-| Red Blink x3 | Target acquired for the first time or ≥ 30s re‑detect |
+| Green Blink x3 | Target acquired for the first time or ≥ 30s re‑detect |
 | Blue Pulse | Waiting for GPS fix (pulses faster with more satellites) |
 
 
