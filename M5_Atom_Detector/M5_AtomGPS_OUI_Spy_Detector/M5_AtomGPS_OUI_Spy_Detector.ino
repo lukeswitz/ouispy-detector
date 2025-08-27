@@ -219,11 +219,11 @@ void LEDTask(void* pvParameters) {
           unsigned long elapsed = currentMillis - patternStartTime;
 
           if (elapsed < 150) {
-            M5.dis.drawpix(0, 0x00FF00); 
+            M5.dis.drawpix(0, 0x00FF00);
           } else if (elapsed < 300) {
             M5.dis.drawpix(0, 0x000000);
           } else if (elapsed < 450) {
-            M5.dis.drawpix(0, 0x00FF00); 
+            M5.dis.drawpix(0, 0x00FF00);
           } else if (elapsed < 600) {
             M5.dis.drawpix(0, 0x000000);
           } else if (elapsed < 750) {
@@ -327,7 +327,7 @@ void ScanTask(void* pvParameters) {
         if (pBLEScan) {
           pBLEScan->stop();
           vTaskDelay(10 / portTICK_PERIOD_MS);
-          pBLEScan->start(0.8, false, false);  
+          pBLEScan->start(0.8, false, false);
         }
         lastScanTime = currentMillis;
       }
@@ -556,16 +556,25 @@ void performWiFiScan() {
 }
 
 void processWiFiResults(int networksFound) {
+  unsigned long currentMillis = millis();
+  
   for (int i = 0; i < networksFound; i++) {
     String bssid = WiFi.BSSIDstr(i);
     String ssid = WiFi.SSID(i);
     int rssi = WiFi.RSSI(i);
 
-    unsigned long currentMillis = millis();
+    Serial.print("WiFi Device found: ");
+    Serial.println(bssid);
+
     String matchedDescription;
     bool matchFound = matchesTargetFilter(bssid, matchedDescription);
 
-    if (!matchFound) continue;
+    if (!matchFound) {
+      // Serial.println("No match, skipping");
+      continue;  // This should skip non-matching devices
+    }
+
+    Serial.println("MATCHED FILTER: " + matchedDescription);
 
     bool known = false;
     for (auto& dev : devices) {
@@ -650,6 +659,11 @@ bool isValidMAC(const String& mac) {
 }
 
 bool matchesTargetFilter(const String& deviceMAC, String& matchedDescription) {
+  // Stop immediately if no filters configured
+  if (targetFilters.empty()) {
+    return false;
+  }
+
   String normalizedDeviceMAC = deviceMAC;
   normalizeMACAddress(normalizedDeviceMAC);
 
@@ -699,7 +713,6 @@ void loadConfiguration() {
 
   targetFilters.clear();
 
-  // Load saved filters or use defaults
   if (filterCount > 0) {
     for (int i = 0; i < filterCount; i++) {
       String keyId = "id_" + String(i);
@@ -715,12 +728,8 @@ void loadConfiguration() {
         targetFilters.push_back(filter);
       }
     }
-  } else {
-    // Default configuration with some common OUIs
-    targetFilters.push_back({ "AA:BB:CC", false, "Example OUI 1" });
-    targetFilters.push_back({ "DD:EE:FF", false, "Example OUI 2" });
-    targetFilters.push_back({ "AA:BB:CC:12:34:56", true, "Specific Device" });
   }
+  // NO DEFAULT FILTERS ADDED HERE
 
   preferences.end();
   Serial.println("Configuration loaded - " + String(targetFilters.size()) + " filters");
@@ -1141,21 +1150,19 @@ class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
     int rssi = advertisedDevice->getRSSI();
     unsigned long currentMillis = millis();
 
-    // Debug output for all devices
-    Serial.printf("BLE Device: MAC=%s, RSSI=%d", mac.c_str(), rssi);
-    if (advertisedDevice->haveName()) {
-      Serial.printf(", Name=%s", advertisedDevice->getName().c_str());
-    }
-    Serial.println();
+    // Serial.print("BLE Device found: ");
+    // Serial.println(mac);
 
     String matchedDescription;
     bool matchFound = matchesTargetFilter(mac, matchedDescription);
 
-    // // Debug the matching process
-    // if (!matchFound) {
-    //   Serial.println("No match for: " + mac);
-    //   return;
-    // }
+    // Add debug to confirm if it matched
+    if (!matchFound) {
+      // Serial.println("No match, skipping");
+      return;  // skip non-matching devices
+    }
+
+    Serial.println("MATCHED FILTER: " + matchedDescription);
 
     bool known = false;
     for (auto& dev : devices) {
@@ -1357,21 +1364,21 @@ void setup() {
 
   if (factoryReset) {
     Serial.println("FACTORY RESET FLAG DETECTED - Clearing all data...");
-    
+
     // Clear all NVS
     nvs_flash_erase();
     nvs_flash_init();
-    
+
     // Clear preferences
     preferences.begin("ouispy", false);
     preferences.clear();
     preferences.putBool("factoryReset", false);  // Reset the flag
     preferences.end();
-    
+
     // Clear vectors
     targetFilters.clear();
     devices.clear();
-    
+
     Serial.println("Factory reset complete - starting with clean state");
   } else {
     Serial.println("Loading configuration...");
