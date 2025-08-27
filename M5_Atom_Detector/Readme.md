@@ -10,8 +10,8 @@ Related fork [Fox Hunter variant](https://github.com/lukeswitz/ouispy-foxhunter/
 ## Hardware
 
 - Boards:
-  - ATOM Lite (ESP32, 1x NeoPixel)
-  - ATOM GPS (ESP32 with integrated GPS; equivalent to ATOM Lite + Atomic GPS)
+  - ATOM Lite (ESP32, 1x NeoPixel) - Unmaintained FW
+  - ATOM GPS (ESP32 with integrated GPS; equivalent to ATOM Lite + Atomic GPS) - Recommended
 
 ---
 
