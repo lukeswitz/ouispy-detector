@@ -886,7 +886,7 @@ String generateConfigHTML() {
         <div class="status">
     Configure MAC addresses and OUI prefixes to detect. LED patterns:
     <br><strong>Green x3:</strong> New device or re-detected after 30s
-    <br><strong>Blue x2:</strong> Re-detected after 5s
+    <br><strong>Red x2:</strong> Re-detected after 5s
     <br><strong>Dim Purple:</strong> Steady scanning status blink
     <br><strong>Orange:</strong> Configuration mode
     <br><strong>Purple fade:</strong> Ready signal when switching modes
@@ -1357,10 +1357,21 @@ void setup() {
 
   if (factoryReset) {
     Serial.println("FACTORY RESET FLAG DETECTED - Clearing all data...");
+    
+    // Clear all NVS
+    nvs_flash_erase();
+    nvs_flash_init();
+    
+    // Clear preferences
     preferences.begin("ouispy", false);
     preferences.clear();
+    preferences.putBool("factoryReset", false);  // Reset the flag
     preferences.end();
+    
+    // Clear vectors
     targetFilters.clear();
+    devices.clear();
+    
     Serial.println("Factory reset complete - starting with clean state");
   } else {
     Serial.println("Loading configuration...");
