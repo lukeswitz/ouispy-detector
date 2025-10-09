@@ -12,6 +12,7 @@
 #include <nvs_flash.h>
 #include <vector>
 #include <algorithm>
+#include <Adafruit_NeoPixel.h>
 
 // ================================
 // Pin and Buzzer Definitions - Xiao ESP32 S3
@@ -21,6 +22,23 @@
 #define BUZZER_DUTY 127  // 50% duty cycle for good volume without excessive power draw
 #define BEEP_DURATION 200  // Duration of each beep in ms
 #define BEEP_PAUSE 150  // Pause between beeps in ms
+#define LED_PIN 21   // GPIO21 for onboard LED (inverted logic)
+
+// ================================
+// NeoPixel Definitions - Xiao ESP32 S3
+// ================================
+#define NEOPIXEL_PIN 4   // GPIO4 (D3) for NeoPixel - confirmed safe pin on Xiao ESP32 S3
+#define NEOPIXEL_COUNT 1 // Number of NeoPixels (1 for single pixel)
+#define NEOPIXEL_BRIGHTNESS 50 // Brightness (0-255)
+#define NEOPIXEL_DETECTION_BRIGHTNESS 200 // Brightness during detection (0-255)
+
+// NeoPixel object
+Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// NeoPixel state variables
+bool detectionMode = false;
+unsigned long detectionStartTime = 0;
+int detectionFlashCount = 0;
 
 // ================================
 // WiFi AP Configuration
@@ -56,6 +74,10 @@ int detectedRSSI = 0;
 String matchedFilter = "";
 String matchType = "";  // "NEW", "RE-5s", "RE-30s"
 
+// Persistent settings
+bool buzzerEnabled = true;
+bool ledEnabled = true;
+
 // Device tracking
 struct DeviceInfo {
     String macAddress;
@@ -78,6 +100,7 @@ std::vector<TargetFilter> targetFilters;
 
 // Forward declarations
 void startScanningMode();
+void startDetectionFlash();
 class MyAdvertisedDeviceCallbacks;
 
 // ================================
@@ -93,6 +116,21 @@ bool isSerialConnected() {
 }
 
 // ================================
+// LED Control Functions (inverted logic for Xiao ESP32-S3)
+// ================================
+void ledOn() {
+    if (ledEnabled) {
+        digitalWrite(LED_PIN, LOW);  // LOW = LED ON for Xiao ESP32-S3
+    }
+}
+
+void ledOff() {
+    if (ledEnabled) {
+        digitalWrite(LED_PIN, HIGH); // HIGH = LED OFF for Xiao ESP32-S3
+    }
+}
+
+// ================================
 // Buzzer Functions
 // ================================
 void initializeBuzzer() {
@@ -100,6 +138,10 @@ void initializeBuzzer() {
     digitalWrite(BUZZER_PIN, LOW);
     ledcSetup(0, BUZZER_FREQ, 8);
     ledcAttachPin(BUZZER_PIN, 0);
+    
+    // Setup LED (inverted logic - HIGH = OFF for Xiao ESP32-S3)
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
 }
 
 void digitalBeep(int duration) {
@@ -113,17 +155,164 @@ void digitalBeep(int duration) {
 }
 
 void singleBeep() {
-    ledcWrite(0, BUZZER_DUTY);
+    if (buzzerEnabled) {
+        ledcWrite(0, BUZZER_DUTY);
+    }
+    ledOn();
     delay(BEEP_DURATION);
-    ledcWrite(0, 0);
-    digitalBeep(BEEP_DURATION);
+    if (buzzerEnabled) {
+        ledcWrite(0, 0);
+        digitalBeep(BEEP_DURATION);
+    }
+    ledOff();
 }
 
 void threeBeeps() {
+    // Start detection flash animation
+    startDetectionFlash();
+    
     for(int i = 0; i < 3; i++) {
         singleBeep();
         if (i < 2) delay(BEEP_PAUSE);
     }
+}
+
+// ================================
+// NeoPixel Functions
+// ================================
+void initializeNeoPixel() {
+    strip.begin();
+    strip.setBrightness(NEOPIXEL_BRIGHTNESS);
+    strip.clear();
+    strip.show();
+}
+
+// Convert HSV to RGB
+uint32_t hsvToRgb(uint16_t h, uint8_t s, uint8_t v) {
+    uint8_t r, g, b;
+    
+    if (s == 0) {
+        r = g = b = v;
+    } else {
+        uint8_t region = h / 43;
+        uint8_t remainder = (h - (region * 43)) * 6;
+        
+        uint8_t p = (v * (255 - s)) >> 8;
+        uint8_t q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+        uint8_t t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+        
+        switch (region) {
+            case 0: r = v; g = t; b = p; break;
+            case 1: r = q; g = v; b = p; break;
+            case 2: r = p; g = v; b = t; break;
+            case 3: r = p; g = q; b = v; break;
+            case 4: r = t; g = p; b = v; break;
+            default: r = v; g = p; b = q; break;
+        }
+    }
+    
+    return strip.Color(r, g, b);
+}
+
+// Normal pink breathing animation
+void normalBreathingAnimation() {
+    static unsigned long lastUpdate = 0;
+    static float brightness = 0.0;
+    static bool increasing = true;
+    
+    unsigned long currentTime = millis();
+    
+    // Update every 20ms for smooth animation
+    if (currentTime - lastUpdate >= 20) {
+        lastUpdate = currentTime;
+        
+        // Update brightness (breathing effect)
+        if (increasing) {
+            brightness += 0.02;
+            if (brightness >= 1.0) {
+                brightness = 1.0;
+                increasing = false;
+            }
+        } else {
+            brightness -= 0.02;
+            if (brightness <= 0.1) {
+                brightness = 0.1;
+                increasing = true;
+            }
+        }
+        
+        // Pink color (hue 300) with breathing brightness
+        uint32_t color = hsvToRgb(300, 255, (uint8_t)(NEOPIXEL_BRIGHTNESS * brightness));
+        strip.setPixelColor(0, color);
+        strip.show();
+    }
+}
+
+// Detection flash animation synchronized with beeps
+void detectionFlashAnimation() {
+    unsigned long currentTime = millis();
+    unsigned long elapsed = currentTime - detectionStartTime;
+    
+    // Calculate which flash we're on based on elapsed time
+    int currentFlash = (elapsed / (BEEP_DURATION + BEEP_PAUSE)) % 3;
+    unsigned long flashProgress = elapsed % (BEEP_DURATION + BEEP_PAUSE);
+    
+    // Determine color based on flash number
+    uint16_t hue;
+    if (currentFlash == 0) {
+        hue = 240; // Blue
+    } else if (currentFlash == 1) {
+        hue = 300; // Pink
+    } else {
+        hue = 270; // Purple
+    }
+    
+    // Flash brightness - bright during beep, dim during pause
+    uint8_t brightness;
+    if (flashProgress < BEEP_DURATION) {
+        // During beep - bright flash
+        brightness = NEOPIXEL_DETECTION_BRIGHTNESS;
+    } else {
+        // During pause - dim
+        brightness = NEOPIXEL_BRIGHTNESS / 4;
+    }
+    
+    // Set color
+    uint32_t color = hsvToRgb(hue, 255, brightness);
+    strip.setPixelColor(0, color);
+    strip.show();
+    
+    // End detection mode after 3 flashes (same as threeBeeps)
+    if (elapsed >= (BEEP_DURATION + BEEP_PAUSE) * 3) {
+        detectionMode = false;
+    }
+}
+
+// Main animation function
+void updateNeoPixelAnimation() {
+    if (detectionMode) {
+        detectionFlashAnimation();
+    } else {
+        normalBreathingAnimation();
+    }
+}
+
+// Set NeoPixel to a specific color
+void setNeoPixelColor(uint8_t r, uint8_t g, uint8_t b) {
+    strip.setPixelColor(0, strip.Color(r, g, b));
+    strip.show();
+}
+
+// Turn off NeoPixel
+void turnOffNeoPixel() {
+    strip.clear();
+    strip.show();
+}
+
+// Start detection flash animation
+void startDetectionFlash() {
+    detectionMode = true;
+    detectionStartTime = millis();
 }
 
 void twoBeeps() {
@@ -139,15 +328,23 @@ void ascendingBeeps() {
     int fastPause = 100; // Faster than normal beeps
     
     for (int i = 0; i < 2; i++) {
-        ledcSetup(0, frequencies[i], 8);
-        ledcWrite(0, BUZZER_DUTY);
+        if (buzzerEnabled) {
+            ledcSetup(0, frequencies[i], 8);
+            ledcWrite(0, BUZZER_DUTY);
+        }
+        ledOn();
         delay(BEEP_DURATION);
-        ledcWrite(0, 0);
+        if (buzzerEnabled) {
+            ledcWrite(0, 0);
+        }
+        ledOff();
         if (i < 1) delay(fastPause);
     }
     
     // Reset to original frequency for future beeps
-    ledcSetup(0, BUZZER_FREQ, 8);
+    if (buzzerEnabled) {
+        ledcSetup(0, BUZZER_FREQ, 8);
+    }
 }
 
 // ================================
@@ -156,6 +353,8 @@ void ascendingBeeps() {
 void saveConfiguration() {
     preferences.begin("ouispy", false);
     preferences.putInt("filterCount", targetFilters.size());
+    preferences.putBool("buzzerEnabled", buzzerEnabled);
+    preferences.putBool("ledEnabled", ledEnabled);
     
     for (int i = 0; i < targetFilters.size(); i++) {
         String keyId = "id_" + String(i);
@@ -177,6 +376,8 @@ void saveConfiguration() {
 void loadConfiguration() {
     preferences.begin("ouispy", true);
     int filterCount = preferences.getInt("filterCount", 0);
+    buzzerEnabled = preferences.getBool("buzzerEnabled", true);
+    ledEnabled = preferences.getBool("ledEnabled", true);
     
     targetFilters.clear();
     
@@ -208,6 +409,8 @@ void loadConfiguration() {
     if (isSerialConnected()) {
         Serial.println("Configuration loaded from NVS");
         Serial.println("Loaded " + String(targetFilters.size()) + " filters");
+        Serial.println("Buzzer enabled: " + String(buzzerEnabled ? "Yes" : "No"));
+        Serial.println("LED enabled: " + String(ledEnabled ? "Yes" : "No"));
     }
 }
 
@@ -565,6 +768,32 @@ const char* getConfigHTML() {
             margin-top: 8px; 
             line-height: 1.4;
         }
+        .toggle-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .toggle-item {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .toggle-item input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            accent-color: #4ecdc4;
+            cursor: pointer;
+        }
+        .toggle-label {
+            font-weight: 500;
+            color: #ffffff;
+            cursor: pointer;
+            user-select: none;
+        }
         button { 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
             color: #ffffff; 
@@ -630,6 +859,22 @@ DD:EE:FF:ab:cd:ef
                 <div class="help-text">
                     Full MAC addresses match specific devices only.<br>
                     Format: XX:XX:XX:XX:XX:XX (17 characters with colons)
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3>Audio & Visual Settings</h3>
+                <div class="toggle-container">
+                    <div class="toggle-item">
+                        <input type="checkbox" id="buzzerEnabled" name="buzzerEnabled" %BUZZER_CHECKED%>
+                        <label class="toggle-label" for="buzzerEnabled">Enable Buzzer</label>
+                        <div class="help-text" style="margin-top: 0;">Audio feedback for target detection</div>
+                    </div>
+                    <div class="toggle-item">
+                        <input type="checkbox" id="ledEnabled" name="ledEnabled" %LED_CHECKED%>
+                        <label class="toggle-label" for="ledEnabled">Enable LED Blinking</label>
+                        <div class="help-text" style="margin-top: 0;">Orange LED blinks with same pattern as buzzer</div>
+                    </div>
                 </div>
             </div>
             
@@ -736,6 +981,11 @@ String generateConfigHTML() {
     
     html.replace("%OUI_VALUES%", ouiValues);
     html.replace("%MAC_VALUES%", macValues);
+    
+    // Replace toggle states
+    html.replace("%BUZZER_CHECKED%", buzzerEnabled ? "checked" : "");
+    html.replace("%LED_CHECKED%", ledEnabled ? "checked" : "");
+    
     return html;
 }
 
@@ -864,6 +1114,15 @@ void startConfigMode() {
                     }
                 }
             }
+        }
+        
+        // Process buzzer and LED toggles
+        buzzerEnabled = request->hasParam("buzzerEnabled", true);
+        ledEnabled = request->hasParam("ledEnabled", true);
+        
+        if (isSerialConnected()) {
+            Serial.println("Buzzer enabled: " + String(buzzerEnabled ? "Yes" : "No"));
+            Serial.println("LED enabled: " + String(ledEnabled ? "Yes" : "No"));
         }
         
         if (targetFilters.size() > 0) {
@@ -1134,7 +1393,8 @@ void setup() {
     
     Serial.println("\n\n=== OUI Spy Enhanced BLE Detector ===");
     Serial.println("Hardware: Xiao ESP32 S3");
-    Serial.println("Buzzer: GPIO3");
+    Serial.println("Buzzer: GPIO3 (D2)");
+    Serial.println("NeoPixel: GPIO4 (D3)");
     Serial.println("Initializing...");
     
     // Randomize MAC address on each boot
@@ -1180,6 +1440,16 @@ void setup() {
     Serial.println("Testing buzzer...");
     singleBeep();
     delay(500);
+    
+    Serial.println("Initializing NeoPixel...");
+    initializeNeoPixel();
+    
+    // Test NeoPixel
+    Serial.println("Testing NeoPixel...");
+    setNeoPixelColor(255, 0, 255); // Bright pink
+    delay(1000);
+    setNeoPixelColor(128, 0, 255); // Purple
+    delay(1000);
     
     // Check for factory reset flag first
     preferences.begin("ouispy", true); // read-only
@@ -1344,6 +1614,9 @@ void loop() {
             lastStatusTime = currentMillis;
         }
     }
+    
+    // Update NeoPixel animation
+    updateNeoPixelAnimation();
     
     delay(100);
 } 
