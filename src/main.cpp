@@ -18,8 +18,8 @@
 // Pin and Buzzer Definitions - Xiao ESP32 S3
 // ================================
 #define BUZZER_PIN 3   // GPIO3 (D2) for buzzer - good PWM pin on Xiao ESP32 S3
-#define BUZZER_FREQ 2000  // Frequency in Hz
-#define BUZZER_DUTY 127  // 50% duty cycle for good volume without excessive power draw
+#define BUZZER_FREQ 1600  // Frequency in Hz
+#define BUZZER_DUTY 100  // 50% duty cycle for good volume without excessive power draw
 #define BEEP_DURATION 200  // Duration of each beep in ms
 #define BEEP_PAUSE 150  // Pause between beeps in ms
 #define LED_PIN 21   // GPIO21 for onboard LED (inverted logic)
@@ -28,9 +28,11 @@
 // NeoPixel Definitions - Xiao ESP32 S3
 // ================================
 #define NEOPIXEL_PIN 4   // GPIO4 (D3) for NeoPixel - confirmed safe pin on Xiao ESP32 S3
-#define NEOPIXEL_COUNT 1 // Number of NeoPixels (1 for single pixel)
+#define NEOPIXEL_COUNT 8 // Number of NeoPixels (1 for single pixel)
 #define NEOPIXEL_BRIGHTNESS 50 // Brightness (0-255)
 #define NEOPIXEL_DETECTION_BRIGHTNESS 200 // Brightness during detection (0-255)
+int averageRSSI = -100;
+unsigned long lastRSSIUpdate = 0;
 
 // NeoPixel object
 Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -38,7 +40,8 @@ Adafruit_NeoPixel strip(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 // NeoPixel state variables
 bool detectionMode = false;
 unsigned long detectionStartTime = 0;
-int detectionFlashCount = 0;
+unsigned long startupAnimationTime = 0;
+bool startupAnimationComplete = false;
 
 // ================================
 // WiFi AP Configuration
@@ -109,7 +112,6 @@ std::vector<DeviceAlias> deviceAliases;
 // Forward declarations
 void startScanningMode();
 void startDetectionFlash();
-class MyAdvertisedDeviceCallbacks;
 
 // ================================
 // Serial Configuration
@@ -193,6 +195,8 @@ void initializeNeoPixel() {
     strip.setBrightness(NEOPIXEL_BRIGHTNESS);
     strip.clear();
     strip.show();
+    startupAnimationTime = millis();
+    startupAnimationComplete = false;
 }
 
 // Convert HSV to RGB
@@ -221,6 +225,149 @@ uint32_t hsvToRgb(uint16_t h, uint8_t s, uint8_t v) {
     
     return strip.Color(r, g, b);
 }
+
+void startupAnimation() {
+    // No duration check - runs until startupAnimationComplete is set by startScanningMode()
+    
+    unsigned long elapsed = millis() - startupAnimationTime;
+    
+    // Progress bar showing config time elapsed
+    // Wraps around every 25 seconds for visual variety
+    float progress = (float)(elapsed % 25000) / 25000.0;
+    int litPixels = (int)(progress * NEOPIXEL_COUNT);
+    
+    // Color cycles through spectrum
+    uint16_t baseHue = ((elapsed / 120) % 360) * 256 / 360;
+    
+    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+        if (i < litPixels) {
+            // Filled portion
+            uint8_t brightness = NEOPIXEL_BRIGHTNESS / 3;
+            uint16_t hue = baseHue + (i * 10);
+            strip.setPixelColor(i, hsvToRgb(hue, 255, brightness));
+        } else if (i == litPixels) {
+            // Leading edge - pulsing
+            float pulse = sin(millis() * 0.009) * 0.5 + 0.5;
+            uint8_t brightness = (uint8_t)(NEOPIXEL_BRIGHTNESS * pulse / 2);
+            strip.setPixelColor(i, hsvToRgb(baseHue, 255, brightness));
+        } else {
+            // Empty portion - very dim
+            strip.setPixelColor(i, hsvToRgb(baseHue, 100, 2));
+        }
+    }
+    
+    strip.show();
+}
+
+// Normal scanning animation: flowing wave pattern
+void normalScanningAnimation() {
+    static unsigned long lastUpdate = 0;
+    static float colorPhase = 0.0;
+    static float wavePosition = 0.0;
+    
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastUpdate >= 30) {
+        lastUpdate = currentTime;
+        
+        // Map RSSI to bar display
+        int signalBars = map(constrain(averageRSSI, -100, -30), -100, -30, 0, NEOPIXEL_COUNT);
+        signalBars = constrain(signalBars, 0, NEOPIXEL_COUNT);
+        
+        // Move wave
+        wavePosition += 0.25;
+        if (wavePosition >= NEOPIXEL_COUNT) wavePosition = 0.0;
+        
+        // Cycle colors
+        colorPhase += 0.5;
+        if (colorPhase >= 360) colorPhase = 0.0;
+        
+        uint16_t baseHue;
+        if (colorPhase < 72) {
+            baseHue = 120; // Green
+        } else if (colorPhase < 144) {
+            baseHue = 180; // Cyan
+        } else if (colorPhase < 216) {
+            baseHue = 240; // Blue
+        } else if (colorPhase < 288) {
+            baseHue = 270; // Purple
+        } else {
+            baseHue = 300; // Pink
+        }
+        
+        for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+            // Calculate sine wave at this position
+            float wavePhase = (wavePosition + i) / (float)NEOPIXEL_COUNT * PI * 2;
+            float waveValue = sin(wavePhase) * 0.5 + 0.5; // 0-1 range
+            
+            if (i < signalBars) {
+                // Lit segment - wave modulates brightness
+                uint8_t baseBrightness = NEOPIXEL_BRIGHTNESS / 2;
+                uint8_t waveBrightness = (uint8_t)(baseBrightness * waveValue);
+                uint8_t finalBrightness = baseBrightness + waveBrightness;
+                
+                // Hue shifts with wave
+                uint16_t pixelHue = baseHue + (i * 5) + (uint16_t)(waveValue * 30);
+                
+                strip.setPixelColor(i, hsvToRgb(pixelHue, 255, finalBrightness));
+            } else {
+                // Dark segment - wave is barely visible
+                uint8_t dimBrightness = (uint8_t)(waveValue * 10);
+                strip.setPixelColor(i, hsvToRgb(baseHue, 255, dimBrightness));
+            }
+        }
+        
+        strip.show();
+    }
+}
+
+// Detection animation: explosive burst from center outward
+void detectionAnimation() {
+    unsigned long elapsed = millis() - detectionStartTime;
+    const unsigned long FLASH_DURATION = BEEP_DURATION;
+    const unsigned long PAUSE_DURATION = BEEP_PAUSE;
+    const unsigned long CYCLE_DURATION = FLASH_DURATION + PAUSE_DURATION;
+    
+    int cycle = elapsed / CYCLE_DURATION;
+    unsigned long cycleProgress = elapsed % CYCLE_DURATION;
+    
+    if (cycle >= 3) {
+        detectionMode = false;
+        return;
+    }
+    
+    uint16_t colors[3] = {240, 300, 270};
+    uint16_t currentHue = colors[cycle];
+    
+    if (cycleProgress < FLASH_DURATION) {
+        // Explosion phase: burst from center outward
+        float progress = (float)cycleProgress / FLASH_DURATION;
+        float radius = progress * 4.0;
+        
+        for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+            float distance = abs(i - 3.5);
+            
+            if (distance <= radius) {
+                float intensity = 1.0 - (distance / radius) * 0.5;
+                uint8_t brightness = (uint8_t)(NEOPIXEL_DETECTION_BRIGHTNESS * intensity);
+                strip.setPixelColor(i, hsvToRgb(currentHue, 255, brightness));
+            } else {
+                strip.setPixelColor(i, 0);
+            }
+        }
+    } else {
+        // Fade phase
+        float fadeProgress = (float)(cycleProgress - FLASH_DURATION) / PAUSE_DURATION;
+        uint8_t brightness = (uint8_t)(NEOPIXEL_BRIGHTNESS * (1.0 - fadeProgress) * 0.3);
+        
+        for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+            strip.setPixelColor(i, hsvToRgb(currentHue, 255, brightness));
+        }
+    }
+    
+    strip.show();
+}
+
 
 // Normal pink breathing animation
 void normalBreathingAnimation() {
@@ -298,31 +445,31 @@ void detectionFlashAnimation() {
 
 // Main animation function
 void updateNeoPixelAnimation() {
-    if (detectionMode) {
-        detectionFlashAnimation();
+    if (!startupAnimationComplete) {
+        startupAnimation();
+    } else if (detectionMode) {
+        detectionAnimation();
     } else {
-        normalBreathingAnimation();
+        normalScanningAnimation();
     }
 }
 
-// Set NeoPixel to a specific color
 void setNeoPixelColor(uint8_t r, uint8_t g, uint8_t b) {
-    strip.setPixelColor(0, strip.Color(r, g, b));
+    for (int i = 0; i < NEOPIXEL_COUNT; i++) {
+        strip.setPixelColor(i, strip.Color(r, g, b));
+    }
     strip.show();
 }
 
-// Turn off NeoPixel
 void turnOffNeoPixel() {
     strip.clear();
     strip.show();
 }
 
-// Start detection flash animation
 void startDetectionFlash() {
     detectionMode = true;
     detectionStartTime = millis();
 }
-
 void twoBeeps() {
     for(int i = 0; i < 2; i++) {
         singleBeep();
@@ -2022,6 +2169,9 @@ void startConfigMode() {
 // ================================
 // BLE Advertised Device Callback Class
 // ================================
+// ================================
+// BLE Advertised Device Callback Class
+// ================================
 class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
     void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
         if (currentMode != SCANNING_MODE) return;
@@ -2029,6 +2179,12 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
         String mac = advertisedDevice->getAddress().toString().c_str();
         int rssi = advertisedDevice->getRSSI();
         unsigned long currentMillis = millis();
+        
+        // Update average RSSI for visualization
+        if (currentMillis - lastRSSIUpdate > 100) {
+            averageRSSI = (averageRSSI * 0.8) + (rssi * 0.2);
+            lastRSSIUpdate = currentMillis;
+        }
 
         String matchedDescription;
         bool matchFound = matchesTargetFilter(mac, matchedDescription);
@@ -2050,7 +2206,6 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
                     unsigned long timeSinceLastSeen = currentMillis - dev.lastSeen;
 
                     if (timeSinceLastSeen >= 30000) {
-                        // Store data for main loop to process
                         detectedMAC = mac;
                         detectedRSSI = rssi;
                         matchedFilter = matchedDescription;
@@ -2061,7 +2216,6 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
                         dev.inCooldown = true;
                         dev.cooldownUntil = currentMillis + 10000;
                     } else if (timeSinceLastSeen >= 5000) {
-                        // Store data for main loop to process
                         detectedMAC = mac;
                         detectedRSSI = rssi;
                         matchedFilter = matchedDescription;
@@ -2090,7 +2244,6 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
                 newDev.filterDescription = matchedDescription;
                 devices.push_back(newDev);
 
-                // Store data for main loop to process
                 detectedMAC = mac;
                 detectedRSSI = rssi;
                 matchedFilter = matchedDescription;
@@ -2109,6 +2262,7 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
 void startScanningMode() {
     currentMode = SCANNING_MODE;
+    startupAnimationComplete = true;
     
     // Stop web server and WiFi
     server.end();
@@ -2222,16 +2376,16 @@ void setup() {
     initializeBuzzer();
     
     // Test buzzer
-    singleBeep();
-    delay(500);
+    // singleBeep();
+    // delay(500);
     
     initializeNeoPixel();
     
-    // Test NeoPixel
-    setNeoPixelColor(255, 0, 255); // Bright pink
-    delay(1000);
-    setNeoPixelColor(128, 0, 255); // Purple
-    delay(1000);
+    // // Test NeoPixel
+    // setNeoPixelColor(255, 0, 255); // Bright pink
+    // delay(1000);
+    // setNeoPixelColor(128, 0, 255); // Purple
+    // delay(1000);
     
     // Check for factory reset flag first
     preferences.begin("ouispy", true); // read-only
@@ -2290,6 +2444,9 @@ void loop() {
     static unsigned long lastStatusTime = 0;
     unsigned long currentMillis = millis();
     
+    // Update NeoPixel animation FIRST (works in all modes)
+    updateNeoPixelAnimation();
+    
     if (currentMode == CONFIG_MODE) {
         // Check for scheduled normal restart (from burn-in config)
         if (normalRestartScheduled > 0 && currentMillis >= normalRestartScheduled) {
@@ -2297,8 +2454,8 @@ void loop() {
                 Serial.println("Scheduled normal restart - rebooting with locked configuration...");
             }
             
-            delay(500); // Give time for any pending operations
-            ESP.restart(); // Simple restart - settings preserved
+            delay(500);
+            ESP.restart();
         }
         
         // Check for scheduled device reset (from web device reset)
@@ -2307,13 +2464,12 @@ void loop() {
                 Serial.println("Scheduled device reset - setting factory reset flag and restarting...");
             }
             
-            // Just set a factory reset flag - much safer than complex NVS operations
             preferences.begin("ouispy", false);
             preferences.putBool("factoryReset", true);
             preferences.end();
             
-            delay(500); // Give time for NVS write
-            ESP.restart(); // Restart - clearing will happen safely on boot
+            delay(500);
+            ESP.restart();
         }
         
         // Check for scheduled mode switch (from web config save)
@@ -2321,14 +2477,13 @@ void loop() {
             if (isSerialConnected()) {
                 Serial.println("Scheduled mode switch - switching to scanning mode");
             }
-            modeSwitchScheduled = 0; // Reset
+            modeSwitchScheduled = 0;
             startScanningMode();
             return;
         }
         
         // Check for config timeout 
         if (targetFilters.size() == 0) {
-            // No saved filters - stay in config mode indefinitely
             if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
                 if (isSerialConnected()) {
                     Serial.println("No one connected and no saved filters - staying in config mode");
@@ -2336,17 +2491,15 @@ void loop() {
                 }
             }
         } else if (targetFilters.size() > 0) {
-            // Have saved filters - timeout only if no one connected
             if (currentMillis - configStartTime > CONFIG_TIMEOUT && lastConfigActivity == configStartTime) {
                 if (isSerialConnected()) {
                     Serial.println("No one connected within 20s - using saved filters, switching to scanning mode");
                 }
                 startScanningMode();
             } else if (lastConfigActivity > configStartTime) {
-                // Someone connected - wait for them to submit (no timeout)
                 if (isSerialConnected() && currentMillis - configStartTime > CONFIG_TIMEOUT) {
                     static unsigned long lastConnectedMsg = 0;
-                    if (currentMillis - lastConnectedMsg > 30000) { // Print every 30s
+                    if (currentMillis - lastConnectedMsg > 30000) {
                         Serial.println("Web interface connected - waiting for configuration submission...");
                         lastConnectedMsg = currentMillis;
                     }
@@ -2354,7 +2507,6 @@ void loop() {
             }
         }
         
-        // Handle web server
         delay(100);
         return;
     }
@@ -2366,7 +2518,6 @@ void loop() {
             if (isSerialConnected()) {
                 String alias = getDeviceAlias(detectedMAC);
                 
-                // Output clean JSON
                 Serial.print("{\"mac\":\"");
                 Serial.print(detectedMAC);
                 Serial.print("\",\"alias\":\"");
@@ -2392,14 +2543,10 @@ void loop() {
             lastCleanupTime = currentMillis;
         }
 
-        // Status report disabled - using JSON output only
         if (currentMillis - lastStatusTime >= 30000) {
             lastStatusTime = currentMillis;
         }
     }
     
-    // Update NeoPixel animation
-    updateNeoPixelAnimation();
-    
     delay(100);
-} 
+}
