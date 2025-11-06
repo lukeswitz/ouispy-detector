@@ -4,7 +4,6 @@ M5Stack ATOM (Lite / ATOM GPS) Unified (beta) detector firmware for multi‐targ
 
 ![image](https://github.com/user-attachments/assets/14f7ec00-2bfe-4ad6-944a-362dbbdd67d4)
 
-Related fork: [Fox Hunter variant](https://github.com/lukeswitz/ouispy-foxhunter/tree/main/M5_Atom_Foxhunt)
 
 ---
 
