@@ -846,23 +846,39 @@ bool matchesTargetFilter(const String& deviceMAC, String& matchedDescription) {
 
 // Configuration Storage Functions
 void saveConfiguration() {
-  preferences.begin("ouispy", false);
-  preferences.putInt("filterCount", targetFilters.size());
-  preferences.putBool("buzzerEnabled", buzzerEnabled);
-  preferences.putBool("ledEnabled", ledEnabled);
-
+  Serial.println("=== SAVING CONFIGURATION ===");
+  Serial.println("Filters to save: " + String(targetFilters.size()));
+  
+  if (!preferences.begin("ouispy", false)) {
+    Serial.println("ERROR: Failed to open NVS for write");
+    return;
+  }
+  
+  size_t written = preferences.putInt("filterCount", targetFilters.size());
+  if (written == 0) {
+    Serial.println("ERROR: Failed to write filterCount");
+    preferences.end();
+    return;
+  }
+  
+  Serial.println("Successfully wrote filterCount: " + String(targetFilters.size()));
+  
   for (int i = 0; i < targetFilters.size(); i++) {
     String keyId = "id_" + String(i);
-    String keyMAC = "mac_" + String(i);
+    String keyMAC = "mac_" + String(i);  
     String keyDesc = "desc_" + String(i);
 
-    preferences.putString(keyId.c_str(), targetFilters[i].identifier);
-    preferences.putBool(keyMAC.c_str(), targetFilters[i].isFullMAC);
-    preferences.putString(keyDesc.c_str(), targetFilters[i].description);
+    size_t id_written = preferences.putString(keyId.c_str(), targetFilters[i].identifier);
+    size_t mac_written = preferences.putBool(keyMAC.c_str(), targetFilters[i].isFullMAC) ? 1 : 0;
+    size_t desc_written = preferences.putString(keyDesc.c_str(), targetFilters[i].description);
+    
+    Serial.println("Filter " + String(i) + " write status - ID:" + String(id_written) + 
+                   " MAC:" + String(mac_written) + " DESC:" + String(desc_written));
   }
 
   preferences.end();
-  Serial.println("Configuration saved to NVS");
+  Serial.println("NVS write completed");
+  Serial.println("===============================");
 }
 
 void loadConfiguration() {
@@ -1665,7 +1681,6 @@ void startScanningMode() {
   Serial.println("WiFi scanning ready!");
   startStatusBlinking();
 }
-
 void setup() {
   delay(2000);
   Serial.begin(115200);
@@ -1766,10 +1781,13 @@ void setup() {
     }
     
     Serial.println("Factory reset complete");
-  } else {
-    loadConfiguration();
-    loadWiFiCredentials();
   }
+
+  Serial.println("DEBUG: About to load configuration...");
+  loadConfiguration();
+  Serial.println("DEBUG: Configuration loaded, filter count: " + String(targetFilters.size()));
+  
+  loadWiFiCredentials();
   
   waitForGPSFix();
   
@@ -1777,6 +1795,25 @@ void setup() {
     initializeFile();
     loadDeviceAliases();
     loadDetectedDevices();
+    
+    // Create empty SD files if they don't exist
+    if (!SD.exists("/aliases.json")) {
+      Serial.println("Creating empty aliases.json");
+      File f = SD.open("/aliases.json", FILE_WRITE);
+      if (f) {
+        f.println("[]");
+        f.close();
+      }
+    }
+    
+    if (!SD.exists("/devices.json")) {
+      Serial.println("Creating empty devices.json");  
+      File f = SD.open("/devices.json", FILE_WRITE);
+      if (f) {
+        f.println("[]");
+        f.close();
+      }
+    }
   } else {
     Serial.println("SD not ready, device tracking disabled.");
   }
@@ -1784,6 +1821,8 @@ void setup() {
   preferences.begin("ouispy", true);
   bool configLocked = preferences.getBool("configLocked", false);
   preferences.end();
+  
+  Serial.println("DEBUG: Final filter count before mode selection: " + String(targetFilters.size()));
   
   if (configLocked) {
     Serial.println("======================================");
