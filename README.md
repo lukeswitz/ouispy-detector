@@ -2,7 +2,7 @@
 
 ![OUI-SPY](ouispy.png)
 
-Professional BLE scanning system that detects specific devices by MAC address or OUI with audio feedback.
+Professional WiFi/BLE scanning system that detects specific devices by MAC address or OUI with audio/visual feedback.
 
 ## Hardware
 
@@ -12,7 +12,7 @@ Professional BLE scanning system that detects specific devices by MAC address or
 - Ready-to-use, no additional components required
 
 **Alternatives:**
-- [M5 Atom Lite/GPS](https://github.com/lukeswitz/ouispy-detector/tree/main/M5_Atom_Detector) WiFi + BLE, logging & location FW
+- [M5 Atom Lite/GPS](https://github.com/lukeswitz/ouispy-detector/tree/main/M5_Atom_Detector) WiFi + BLE detection with GPS and SD logging, visual indicators
 - Standard ESP32-S3/C3 with external buzzer on GPIO3
 
 **Enhanced Version:** Same firmware, add NeoPixel LED for visual feedback
